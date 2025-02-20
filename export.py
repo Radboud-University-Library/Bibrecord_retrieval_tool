@@ -64,7 +64,7 @@ def export_xml_data_to_excel(xml_directory, final_filename, progress_bar):
         return
 
     total_files = len(xml_files)
-    chunk_size = 10
+    chunk_size = 5000
 
     # First pass: determine the complete set of columns across all files
     all_columns = set()

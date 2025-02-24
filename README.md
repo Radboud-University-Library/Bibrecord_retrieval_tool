@@ -25,21 +25,14 @@ This project provides a Streamlit application for uploading a CSV file containin
 1. Clone the repository:
     ```sh
     git clone https://github.com/Feelingthefoo/bibrecord-retrieval-tool.git
-    cd bibrecord-retrieval-tool
     ```
 
-2. Create a virtual environment and activate it:
-    ```sh
-    python -m venv venv
-    source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-    ```
-
-3. Install the required dependencies:
+2. Install the required dependencies:
     ```sh
     pip install -r requirements.txt
     ```
 
-4. Create a `config.ini` file with your WorldCat API credentials:
+3. Create a `config.ini` file with your WorldCat API credentials:
     ```ini
     [WorldCat]
     key=your_key_here

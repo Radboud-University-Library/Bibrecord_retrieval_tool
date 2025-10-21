@@ -50,9 +50,42 @@ def main():
 
     # Main workflow for fetching and saving records
     if csv_uploaded:
-        # Button to fetch all records
-        if st.button("Fetch Record Data"):
-            progress_bar = st.progress(0)
+        # Initialize Stop flag if not present
+        if 'stop' not in st.session_state:
+            st.session_state.stop = False
+
+        # Initialize processing flag if not present
+        if 'processing' not in st.session_state:
+            st.session_state.processing = False
+
+        col1, col2 = st.columns(2)
+        with col1:
+            start_clicked = st.button("Step 1: Fetch Records", disabled=st.session_state.get('processing', False))
+        with col2:
+            if st.session_state.get('processing', False):
+                if st.button("Stop"):
+                    st.session_state.stop = True
+                    st.session_state.processing = False
+                    try:
+                        st.rerun()
+                    except Exception:
+                        st.experimental_rerun()
+
+        # If the Start button was clicked, set processing state and rerun so the Stop button appears immediately
+        if start_clicked and not st.session_state.get('processing', False):
+            st.session_state.stop = False
+            st.session_state.processing = True
+            try:
+                st.rerun()
+            except Exception:
+                st.experimental_rerun()
+
+        # When processing is active, run the long task and show progress + Stop button
+        if st.session_state.get('processing', False):
+            try:
+                progress_bar = st.progress(0.0, text="Starting…")
+            except Exception:
+                progress_bar = st.progress(0)
             remaining_time_placeholder = st.empty()
             start_time = datetime.now()
             max_workers = min(10, (os.cpu_count() or 4) * 2)
@@ -64,22 +97,14 @@ def main():
             st.session_state.all_fetched = all_fetched
             st.session_state.all_saved = all_saved
             st.session_state.error_list = error_list
+            # Mark processing ended
+            st.session_state.processing = False
 
             update_session_state(all_fetched, all_saved, error_list)
 
     # Show export buttons if all records have been fetched and saved successfully
     if st.session_state.all_fetched and st.session_state.all_saved:
         show_export_buttons()
-
-        # Add a download button for the final_data file if it exists
-        if os.path.exists("final_data.xlsx"):
-            with open("final_data.xlsx", "rb") as file:
-                st.download_button(
-                    label="Download final_data.xlsx",
-                    data=file,
-                    file_name="final_data.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
 
 
 if __name__ == "__main__":

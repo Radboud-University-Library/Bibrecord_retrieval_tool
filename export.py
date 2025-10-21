@@ -101,7 +101,7 @@ def export_xml_data_to_excel(xml_directory, final_filename, progress_bar):
                 startrow = writer.book['Sheet1'].max_row
                 df.to_excel(writer, index=False, header=False, startrow=startrow)
 
-        progress_bar.progress((i + len(chunk)) / total_files)
+        progress_bar.progress((i + len(chunk)) / total_files, text=f"XML {min(i+len(chunk), total_files)}/{total_files}")
 
     st.success(f"XML data has been exported to {final_filename}")
 
@@ -138,7 +138,7 @@ def export_json_data_to_excel(json_directory, final_filename, progress_bar):
                 all_data.append(base_record)
 
         # Update progress bar
-        progress_bar.progress((i + 1) / total_files)
+        progress_bar.progress((i + 1) / total_files, text=f"JSON {i+1}/{total_files}")
 
     # Write the flattened JSON data to the final Excel file
     df = pd.DataFrame(all_data)

@@ -12,7 +12,7 @@ import streamlit as st
 import pandas as pd
 import os
 from datetime import datetime
-from utils import process_data, update_session_state, show_export_buttons
+from utils import process_data, update_session_state, show_export_buttons, verify_required_files
 
 
 def main():
@@ -88,7 +88,9 @@ def main():
                 progress_bar = st.progress(0)
             remaining_time_placeholder = st.empty()
             start_time = datetime.now()
-            max_workers = min(10, (os.cpu_count() or 4) * 2)
+            # Expose concurrency control to the user
+            default_workers = min(10, (os.cpu_count() or 4) * 2)
+            max_workers = st.slider("Parallel requests", 1, 32, default_workers)
 
             all_fetched, all_saved, error_list = process_data(
                 data_frame, max_workers, fetch_holdings, start_time, progress_bar, remaining_time_placeholder
@@ -102,9 +104,33 @@ def main():
 
             update_session_state(all_fetched, all_saved, error_list)
 
-    # Show export buttons if all records have been fetched and saved successfully
-    if st.session_state.all_fetched and st.session_state.all_saved:
-        show_export_buttons()
+    # Show export buttons only if all required files are present for all OCNs
+    if st.session_state.all_fetched and st.session_state.all_saved and csv_uploaded:
+        # Build normalized OCN list from the uploaded CSV
+        try:
+            ocn_list = (
+                data_frame['OCLC Number']
+                .astype(str)
+                .str.strip()
+                .tolist()
+            )
+        except Exception:
+            ocn_list = []
+        # Require JSON holdings only if user opted to fetch holdings
+        require_json = bool(fetch_holdings)
+        all_present, missing_xml, missing_json = verify_required_files(ocn_list, require_json=require_json)
+
+        if all_present:
+            show_export_buttons()
+        else:
+            st.error("Cannot generate Excel yet. Some files are missing.")
+            if missing_xml:
+                with st.expander(f"Missing XML files for {len(missing_xml)} OCN(s)", expanded=False):
+                    st.write(", ".join(missing_xml))
+            if require_json and missing_json:
+                with st.expander(f"Missing JSON holdings for {len(missing_json)} OCN(s)", expanded=False):
+                    st.write(", ".join(missing_json))
+            st.info("Please fetch missing records before proceeding to Step 2.")
 
 
 if __name__ == "__main__":

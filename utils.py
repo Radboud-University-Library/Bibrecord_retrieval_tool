@@ -7,9 +7,8 @@ estimating remaining time, updating session state, and displaying export buttons
 
 Functions:
 - process_data(data_frame, max_workers, fetch_holdings, start_time, progress_bar, remaining_time_placeholder)
-- update_progress_bar(progress_bar, completed_count, total_records)
-- update_remaining_time(start_time, completed_count, total_records, remaining_time_placeholder)
 - update_session_state(all_fetched, all_saved, error_list)
+- verify_required_files(ocn_list, require_json)
 - show_export_buttons()
 """
 
@@ -44,6 +43,29 @@ def process_data(data_frame, max_workers, fetch_holdings, start_time, progress_b
     Returns:
         tuple: (all_fetched, all_saved, error_list)
     """
+    # Pre-filter: normalize, drop duplicates, and optionally skip already-downloaded OCNs
+    try:
+        df = data_frame.copy()
+        df['OCLC Number'] = df['OCLC Number'].astype(str).str.strip()
+        # Drop blanks
+        df = df[df['OCLC Number'] != ""]
+        # Drop duplicates
+        df = df.drop_duplicates(subset=['OCLC Number'])
+        if fetch_holdings:
+            # When fetching holdings, process all OCNs (even those with existing XML) so holdings can be fetched-only
+            data_frame = df
+        else:
+            # If not fetching holdings, skip OCNs that already have XML downloaded
+            requested_dir = os.path.join('OCNrecords', 'requested')
+            try:
+                existing = set(os.path.splitext(f)[0] for f in os.listdir(requested_dir))
+            except FileNotFoundError:
+                existing = set()
+            data_frame = df[~df['OCLC Number'].isin(existing)]
+    except Exception:
+        # If anything goes wrong, fall back to original data_frame
+        pass
+
     # Handle empty input early
     total_records = int(len(data_frame))
     if total_records == 0:
@@ -58,8 +80,8 @@ def process_data(data_frame, max_workers, fetch_holdings, start_time, progress_b
     all_saved = True
     error_list = []
 
-    # Chunking
-    chunk_size = max(100, total_records // 10)
+    # Chunking: keep the pool fed with small steady batches
+    chunk_size = max(max_workers * 5, 50)
     completed_count = 0
 
     # ETA smoothing state (EMA of per-record seconds)
@@ -104,83 +126,56 @@ def process_data(data_frame, max_workers, fetch_holdings, start_time, progress_b
     # Initial paint
     push_progress(force=True)
 
-    for chunk_start in range(0, total_records, chunk_size):
-        if st.session_state.get('stop'):
-            break
-        chunk = data_frame.iloc[chunk_start:chunk_start + chunk_size]
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    fetch_and_save_data,
-                    row['OCLC Number'],
-                    fetch_holdings=fetch_holdings
-                ): row['OCLC Number']
-                for _, row in chunk.iterrows()
-            }
-
-            for future in as_completed(futures):
-                if st.session_state.get('stop'):
-                    break
-                ocn = futures[future]
+    # Submit all tasks at once using a single executor for the entire run
+    ocns = data_frame['OCLC Number'].astype(str).tolist()
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    executor_shutdown = False
+    try:
+        futures = {executor.submit(fetch_and_save_data, ocn, fetch_holdings): ocn for ocn in ocns}
+        for future in as_completed(futures):
+            if st.session_state.get('stop'):
+                # Cancel any not-yet-started work to stop quickly
                 try:
-                    ocn, error = future.result()
-                    if error:
-                        error_list.append(f"OCN {ocn}: {error}")
-                        all_fetched = False
-                        all_saved = False
-                except Exception as e:
-                    error_list.append(f"OCN {ocn}: {e}")
+                    executor.shutdown(cancel_futures=True)
+                    executor_shutdown = True
+                except Exception:
+                    pass
+                break
+            ocn = futures[future]
+            try:
+                ocn, error = future.result()
+                if error:
+                    error_list.append(f"OCN {ocn}: {error}")
                     all_fetched = False
                     all_saved = False
+            except Exception as e:
+                error_list.append(f"OCN {ocn}: {e}")
+                all_fetched = False
+                all_saved = False
 
-                completed_count += 1
+            completed_count += 1
 
-                # Update EMA of average seconds per item based on elapsed/completed
-                curr_sec_per_item = (datetime.now() - start_time).total_seconds() / max(1, completed_count)
-                if ema_sec_per_item is None:
-                    ema_sec_per_item = curr_sec_per_item
-                else:
-                    ema_sec_per_item = (1 - ema_tau) * ema_sec_per_item + ema_tau * curr_sec_per_item
+            # Update EMA of average seconds per item based on elapsed/completed
+            curr_sec_per_item = (datetime.now() - start_time).total_seconds() / max(1, completed_count)
+            if ema_sec_per_item is None:
+                ema_sec_per_item = curr_sec_per_item
+            else:
+                ema_sec_per_item = (1 - ema_tau) * ema_sec_per_item + ema_tau * curr_sec_per_item
 
-                # Debounced progress update
-                push_progress()
-
-        # Ensure an update at the end of each chunk
-        push_progress(force=True)
-
-    # Final update
-    push_progress(force=True, final=True)
+            # Debounced progress update
+            push_progress()
+    finally:
+        # Ensure executor is shut down cleanly when not canceled
+        if not executor_shutdown:
+            try:
+                executor.shutdown(wait=True)
+            except Exception:
+                pass
+        # Final update
+        push_progress(force=True, final=True)
     return all_fetched, all_saved, error_list
 
 
-def update_progress_bar(progress_bar, completed_count, total_records):
-    """
-    Update the progress bar in Streamlit.
-
-    Args:
-        progress_bar (streamlit.progress): Progress bar object to update.
-        completed_count (int): Number of completed tasks.
-        total_records (int): Total number of records to process.
-    """
-    progress_bar.progress(completed_count / total_records)
-
-
-def update_remaining_time(start_time, completed_count, total_records, remaining_time_placeholder):
-    """
-    Update the estimated remaining time in Streamlit.
-
-    Args:
-        start_time (datetime): The time the process started.
-        completed_count (int): Number of completed tasks.
-        total_records (int): Total number of records to process.
-        remaining_time_placeholder (streamlit.empty): Placeholder to update remaining time.
-    """
-    elapsed_time = (datetime.now() - start_time).total_seconds()
-    avg_time_per_record = elapsed_time / completed_count
-    remaining_time = avg_time_per_record * (total_records - completed_count)
-    remaining_time_hms = time.strftime('%H:%M:%S', time.gmtime(remaining_time))
-    remaining_time_placeholder.text(
-        f"Progress: {completed_count}/{total_records} - Estimated time to completion: {remaining_time_hms}")
 
 
 def update_session_state(all_fetched, all_saved, error_list):
@@ -204,6 +199,40 @@ def update_session_state(all_fetched, all_saved, error_list):
                     st.write(error)
 
 
+def verify_required_files(ocn_list, require_json: bool = True):
+    """
+    Verify that for every OCN in ocn_list, the expected XML and (optionally) JSON files exist.
+
+    Args:
+        ocn_list (list[str]): List of OCN strings to verify.
+        require_json (bool): If True, JSON holdings files are also required.
+
+    Returns:
+        tuple:
+            (all_present: bool, missing_xml: list[str], missing_json: list[str])
+    """
+    xml_dir = os.path.join('OCNrecords', 'requested')
+    json_dir = os.path.join('OCNrecords', 'requested_holdings')
+
+    missing_xml = []
+    missing_json = []
+
+    for raw in ocn_list:
+        ocn = str(raw).strip()
+        if not ocn:
+            continue
+        xml_path = os.path.join(xml_dir, f"{ocn}.xml")
+        if not os.path.exists(xml_path):
+            missing_xml.append(ocn)
+        if require_json:
+            json_path = os.path.join(json_dir, f"{ocn}_holdings.json")
+            if not os.path.exists(json_path):
+                missing_json.append(ocn)
+
+    all_present = (len(missing_xml) == 0) and ((len(missing_json) == 0) if require_json else True)
+    return all_present, missing_xml, missing_json
+
+
 def show_export_buttons():
     # Ensure session flags exist
     if 'export_complete' not in st.session_state:
@@ -211,8 +240,8 @@ def show_export_buttons():
     if 'final_export_filename' not in st.session_state:
         st.session_state.final_export_filename = ''
 
-    # Button to generate the Excel export (XML + optional JSON holdings)
-    if st.button("Step 2: Generate Excel (XML + optional JSON holdings)"):
+    # Button to generate the Excel export
+    if st.button("Step 2: Generate Excel"):
         xml_directory = 'OCNrecords/requested'
         json_directory = 'OCNrecords/requested_holdings'
         xml_final_filename = 'xml_data.xlsx'

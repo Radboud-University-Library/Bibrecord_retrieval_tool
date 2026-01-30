@@ -194,9 +194,36 @@ def update_session_state(all_fetched, all_saved, error_list):
     else:
         st.error("Some records failed to fetch or save.")
         if error_list:
-            with st.expander(f"Summary of Errors ({len(error_list)})", expanded=False):
+            # Detailed list of each failure
+            with st.expander(f"Detailed errors ({len(error_list)})", expanded=False):
                 for error in error_list:
                     st.write(error)
+
+            # Grouped summary by reason so the user can quickly see why records weren't fetched
+            # Expected error_list entries look like: "OCN 12345: <reason>"
+            grouped = {}
+            for entry in error_list:
+                try:
+                    # Split on the first colon to isolate the reason part
+                    prefix, reason = entry.split(":", 1)
+                    reason = reason.strip()
+                except ValueError:
+                    reason = entry.strip()
+                grouped.setdefault(reason, []).append(entry)
+
+            with st.expander("Why records were not fetched (grouped)", expanded=True):
+                for reason, entries in grouped.items():
+                    # Extract OCNs from the entries for a concise summary line
+                    ocns = []
+                    for e in entries:
+                        # Expect formats like "OCN 12345: ..."
+                        parts = e.split(":", 1)[0].strip().split()
+                        if len(parts) >= 2 and parts[0].upper() == "OCN":
+                            ocns.append(parts[1])
+                    count = len(entries)
+                    st.markdown(f"- {reason} — {count} record(s)")
+                    if ocns:
+                        st.caption("OCNs: " + ", ".join(ocns))
 
 
 def verify_required_files(ocn_list, require_json: bool = True):

@@ -13,6 +13,49 @@ import configparser
 import threading
 
 
+def _friendly_error_message(exc) -> str:
+    """Return a concise, user-friendly reason for a failed fetch.
+
+    Attempts to surface HTTP status codes, authentication/rate-limit issues,
+    timeouts, and common network failures in plain language.
+    """
+    # Try to extract HTTP status code if available
+    status = None
+    try:
+        status = getattr(exc, 'status_code', None) or getattr(getattr(exc, 'response', None), 'status_code', None)
+    except Exception:
+        status = None
+
+    msg = str(exc) if exc else ""
+    low = msg.lower()
+
+    if status is not None:
+        if status == 401:
+            return "Authentication failed (401). Check API key/secret/scope in config.ini."
+        if status == 403:
+            return "Access forbidden (403). Scope/permissions may be insufficient."
+        if status == 404:
+            return "Record not found (404). The OCN may be invalid or not available."
+        if status == 429:
+            return "Rate limited (429). Too many requests — please try again later."
+        if 500 <= status <= 599:
+            return f"WorldCat service error ({status}). Try again later."
+        return f"HTTP error ({status})."
+
+    # No explicit status — try to infer from message
+    if "timed out" in low or "timeout" in low:
+        return "Network timeout contacting WorldCat."
+    if "ssl" in low:
+        return "SSL/TLS connection problem."
+    if "connection" in low and ("refused" in low or "reset" in low or "aborted" in low):
+        return "Network connection error."
+    if "oclc number" in low and "invalid" in low:
+        return "Invalid OCN format."
+
+    # Fallback to raw exception text
+    return msg or "Unknown error"
+
+
 # Read configuration file
 config = configparser.ConfigParser()
 config.read('config.ini')
@@ -189,7 +232,7 @@ def fetch_and_save_data(ocn, fetch_holdings):
                     save_holdingsdata(ocn, holdings)
             return ocn, None
         except Exception as e:
-            return ocn, str(e)
+            return ocn, _friendly_error_message(e)
 
     # Fetch the record and save it to the requested folder
     try:
@@ -205,5 +248,5 @@ def fetch_and_save_data(ocn, fetch_holdings):
         return ocn, None
 
     except Exception as e:
-        return ocn, str(e)
+        return ocn, _friendly_error_message(e)
 

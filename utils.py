@@ -19,6 +19,7 @@ from concurrent.futures import as_completed, ThreadPoolExecutor
 from datetime import datetime
 from request import fetch_and_save_data
 from export import export_xml_data_to_excel, export_json_data_to_excel, merge_excel_files, save_all_xml_to_zip
+import queue
 
 
 def _format_eta(seconds: float) -> str:
@@ -28,34 +29,46 @@ def _format_eta(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def process_data(data_frame, max_workers, fetch_holdings, start_time, progress_bar, remaining_time_placeholder):
+class ProgressReporter:
+    """Thread-safe reporter used by workers to signal finished sub-steps."""
+    def __init__(self):
+        self._q = queue.Queue()
+
+    def xml_done(self, ocn: str):
+        self._q.put(("xml", ocn))
+
+    def json_done(self, ocn: str):
+        self._q.put(("json", ocn))
+
+    def drain(self, max_items: int = 100):
+        out = []
+        for _ in range(max_items):
+            try:
+                out.append(self._q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+
+def process_data(data_frame, max_workers, fetch_holdings, start_time, xml_progress_bar, remaining_time_placeholder, json_progress_bar=None):
     """
-    Process records using ThreadPoolExecutor, fetch data, and update progress bar with debounced ETA text.
+    Process records concurrently and update two progress bars:
+    - XML bar (always shown)
+    - JSON bar (only when fetch_holdings is True)
 
-    Args:
-        data_frame (DataFrame): The dataframe containing OCNs to process.
-        max_workers (int): The maximum number of threads to use.
-        fetch_holdings (bool): Whether to fetch holdings as well.
-        start_time (datetime): The time the process started.
-        progress_bar (streamlit.progress): Progress bar object to update.
-        remaining_time_placeholder (streamlit.empty): Placeholder to update remaining time.
-
-    Returns:
-        tuple: (all_fetched, all_saved, error_list)
+    Returns: (all_fetched, all_saved, error_list)
     """
     # Pre-filter: normalize, drop duplicates, and optionally skip already-downloaded OCNs
+    original_df = data_frame
     try:
         df = data_frame.copy()
         df['OCLC Number'] = df['OCLC Number'].astype(str).str.strip()
-        # Drop blanks
         df = df[df['OCLC Number'] != ""]
-        # Drop duplicates
         df = df.drop_duplicates(subset=['OCLC Number'])
         if fetch_holdings:
             # When fetching holdings, process all OCNs (even those with existing XML) so holdings can be fetched-only
             data_frame = df
         else:
-            # If not fetching holdings, skip OCNs that already have XML downloaded
             requested_dir = os.path.join('OCNrecords', 'requested')
             try:
                 existing = set(os.path.splitext(f)[0] for f in os.listdir(requested_dir))
@@ -63,16 +76,24 @@ def process_data(data_frame, max_workers, fetch_holdings, start_time, progress_b
                 existing = set()
             data_frame = df[~df['OCLC Number'].isin(existing)]
     except Exception:
-        # If anything goes wrong, fall back to original data_frame
-        pass
+        df = original_df
 
-    # Handle empty input early
-    total_records = int(len(data_frame))
-    if total_records == 0:
+    # Totals
+    xml_total = int(len(data_frame))
+    if fetch_holdings:
         try:
-            progress_bar.progress(0.0, text="No records to process.")
+            json_total = int(len(df))
         except Exception:
-            progress_bar.progress(0.0)
+            json_total = xml_total
+    else:
+        json_total = 0
+
+    # Empty check
+    if xml_total == 0:
+        try:
+            xml_progress_bar.progress(0.0, text="No records to process.")
+        except Exception:
+            xml_progress_bar.progress(0.0)
         remaining_time_placeholder.empty()
         return True, True, []
 
@@ -80,67 +101,88 @@ def process_data(data_frame, max_workers, fetch_holdings, start_time, progress_b
     all_saved = True
     error_list = []
 
-    # Chunking: keep the pool fed with small steady batches
-    chunk_size = max(max_workers * 5, 50)
-    completed_count = 0
-
-    # ETA smoothing state (EMA of per-record seconds)
+    # EMA state for XML ETA
     ema_tau = 0.2
     ema_sec_per_item = None
 
     # Debounce settings
     last_ui_update = 0.0
-    min_update_interval = 0.25  # seconds
+    min_update_interval = 0.25
 
-    def push_progress(force: bool = False, final: bool = False):
+    # Sub-step counters
+    xml_completed = 0
+    json_completed = 0
+
+    reporter = ProgressReporter()
+
+    def push_xml_progress(force=False, final=False):
         nonlocal last_ui_update
         now = time.time()
         if not force and (now - last_ui_update) < min_update_interval:
             return
         last_ui_update = now
 
-        frac = completed_count / max(1, total_records)
-        if completed_count == 0 and not final:
-            text = f"Starting… 0/{total_records}"
+        frac = xml_completed / max(1, xml_total)
+        if xml_completed == 0 and not final:
+            text = f"XML • Starting… 0/{xml_total}"
         else:
             elapsed = (datetime.now() - start_time).total_seconds()
-            if ema_sec_per_item is None or completed_count == 0:
-                sec_per_item = elapsed / max(1, completed_count)
+            if ema_sec_per_item is None or xml_completed == 0:
+                sec_per_item = elapsed / max(1, xml_completed)
             else:
                 sec_per_item = ema_sec_per_item
-            remaining = sec_per_item * max(0, total_records - completed_count)
-            text = f"{int(frac*100)}% • {completed_count}/{total_records} • ETA {_format_eta(remaining)}"
+            remaining = sec_per_item * max(0, xml_total - xml_completed)
+            text = f"XML • {int(frac*100)}% • {xml_completed}/{xml_total} • ETA {_format_eta(remaining)}"
 
         if final:
             try:
-                progress_bar.progress(1.0, text=f"100% • {total_records}/{total_records} • Done")
+                xml_progress_bar.progress(1.0, text=f"XML • 100% • {xml_total}/{xml_total} • Done")
             except Exception:
-                progress_bar.progress(1.0)
-            remaining_time_placeholder.empty()
+                xml_progress_bar.progress(1.0)
         else:
             try:
-                progress_bar.progress(frac, text=text)
+                xml_progress_bar.progress(frac, text=text)
             except Exception:
-                progress_bar.progress(frac)
+                xml_progress_bar.progress(frac)
 
-    # Initial paint
-    push_progress(force=True)
+    def push_json_progress(force=False, final=False):
+        if not fetch_holdings or json_progress_bar is None:
+            return
+        frac = json_completed / max(1, json_total)
+        if final:
+            try:
+                json_progress_bar.progress(1.0, text=f"JSON • 100% • {json_total}/{json_total} • Done")
+            except Exception:
+                json_progress_bar.progress(1.0)
+            return
+        try:
+            json_progress_bar.progress(frac, text=f"JSON • {int(frac*100)}% • {json_completed}/{json_total}")
+        except Exception:
+            json_progress_bar.progress(frac)
 
-    # Submit all tasks at once using a single executor for the entire run
+    # Initial paints
+    push_xml_progress(force=True)
+    if fetch_holdings and json_progress_bar is not None:
+        try:
+            json_progress_bar.progress(0.0, text=f"JSON • Starting… 0/{json_total}")
+        except Exception:
+            json_progress_bar.progress(0.0)
+
+    # Submit tasks
     ocns = data_frame['OCLC Number'].astype(str).tolist()
     executor = ThreadPoolExecutor(max_workers=max_workers)
     executor_shutdown = False
     try:
-        futures = {executor.submit(fetch_and_save_data, ocn, fetch_holdings): ocn for ocn in ocns}
+        futures = {executor.submit(fetch_and_save_data, ocn, fetch_holdings, reporter): ocn for ocn in ocns}
         for future in as_completed(futures):
             if st.session_state.get('stop'):
-                # Cancel any not-yet-started work to stop quickly
                 try:
                     executor.shutdown(cancel_futures=True)
                     executor_shutdown = True
                 except Exception:
                     pass
                 break
+
             ocn = futures[future]
             try:
                 ocn, error = future.result()
@@ -153,26 +195,42 @@ def process_data(data_frame, max_workers, fetch_holdings, start_time, progress_b
                 all_fetched = False
                 all_saved = False
 
-            completed_count += 1
+            # Drain events accumulated so far
+            for (kind, _ocn_evt) in reporter.drain():
+                if kind == "xml":
+                    xml_completed += 1
+                elif kind == "json":
+                    json_completed += 1
 
-            # Update EMA of average seconds per item based on elapsed/completed
-            curr_sec_per_item = (datetime.now() - start_time).total_seconds() / max(1, completed_count)
-            if ema_sec_per_item is None:
-                ema_sec_per_item = curr_sec_per_item
-            else:
-                ema_sec_per_item = (1 - ema_tau) * ema_sec_per_item + ema_tau * curr_sec_per_item
+            # Update EMA based on XML progress
+            if xml_completed > 0:
+                curr_sec_per_item = (datetime.now() - start_time).total_seconds() / max(1, xml_completed)
+                if ema_sec_per_item is None:
+                    ema_sec_per_item = curr_sec_per_item
+                else:
+                    ema_sec_per_item = (1 - ema_tau) * ema_sec_per_item + ema_tau * curr_sec_per_item
 
-            # Debounced progress update
-            push_progress()
+            # Debounced UI updates
+            push_xml_progress()
+            push_json_progress()
     finally:
-        # Ensure executor is shut down cleanly when not canceled
         if not executor_shutdown:
             try:
                 executor.shutdown(wait=True)
             except Exception:
                 pass
-        # Final update
-        push_progress(force=True, final=True)
+        # Drain any remaining events
+        for (kind, _ocn_evt) in reporter.drain(100000):
+            if kind == "xml":
+                xml_completed += 1
+            elif kind == "json":
+                json_completed += 1
+        # Final updates
+        push_xml_progress(force=True, final=True)
+        if fetch_holdings and json_progress_bar is not None:
+            push_json_progress(final=True)
+        remaining_time_placeholder.empty()
+
     return all_fetched, all_saved, error_list
 
 

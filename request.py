@@ -56,7 +56,7 @@ def _friendly_error_message(exc) -> str:
     return msg or "Unknown error"
 
 
-# Read configuration file
+# Read the configuration file
 config = configparser.ConfigParser()
 config.read('config.ini')
 
@@ -65,12 +65,16 @@ worldcat_config = config['WorldCat']
 key = worldcat_config.get('key')
 secret = worldcat_config.get('secret')
 scope = worldcat_config.get('scope')
+# Optional: custom User-Agent to identify the application to OCLC
+agent = worldcat_config.get('agent')
 
 # Insert key and secret here
+# Include agent so token requests also identify the application
 token = WorldcatAccessToken(
     key=key,
     secret=secret,
     scopes=scope,
+    agent=agent,
 )
 
 # Configure the MetadataSession with automatic retry functionality
@@ -81,6 +85,7 @@ SESSION_CONFIG = {
     "backoffFactor": 0.5,
     "statusForcelist": [429, 500, 502, 503, 504],
     "allowedMethods": ["GET"],
+    "agent": agent,  # identify the app on all Metadata API calls
 }
 
 # Pre-create output directories once to avoid repeating os.makedirs in hot paths
@@ -98,6 +103,15 @@ def _get_session():
     session = getattr(_thread_local, 'session', None)
     if session is None:
         session = MetadataSession(**SESSION_CONFIG)
+        # Ensure User-Agent header is set (belt-and-suspenders)
+        try:
+            session.headers.update({"User-Agent": agent})
+        except Exception:
+            try:
+                # Some clients expose underlying requests.Session
+                session.session.headers["User-Agent"] = agent  # type: ignore[attr-defined]
+            except Exception:
+                pass
         _thread_local.session = session
     return session
 
@@ -214,10 +228,11 @@ def save_holdingsdata(ocn, holdings_data):
         json.dump(holdings_data, file, ensure_ascii=False)
 
 
-def fetch_and_save_data(ocn, fetch_holdings):
+def fetch_and_save_data(ocn, fetch_holdings, reporter=None):
     """
     Fetch and save the record with the given OCN and optionally fetch holdings.
-    Uses the functions above.
+    Uses the functions above. Reports sub-step completion via `reporter` if provided.
+    Returns (ocn, error or None).
     """
     # Precompute target filepaths using constants
     xml_filepath = os.path.join(REQUESTED_DIR, f'{ocn}.xml')
@@ -226,10 +241,29 @@ def fetch_and_save_data(ocn, fetch_holdings):
     # If XML already exists, we can still fetch holdings if requested
     if os.path.exists(xml_filepath):
         try:
-            if fetch_holdings and not os.path.exists(holdings_filepath):
-                holdings = fetch_holdingsdata(ocn)
-                if holdings:
-                    save_holdingsdata(ocn, holdings)
+            # Report XML already done
+            if reporter is not None:
+                try:
+                    reporter.xml_done(ocn)
+                except Exception:
+                    pass
+            # Handle holdings
+            if fetch_holdings:
+                if os.path.exists(holdings_filepath):
+                    if reporter is not None:
+                        try:
+                            reporter.json_done(ocn)
+                        except Exception:
+                            pass
+                else:
+                    holdings = fetch_holdingsdata(ocn)
+                    if holdings:
+                        save_holdingsdata(ocn, holdings)
+                        if reporter is not None:
+                            try:
+                                reporter.json_done(ocn)
+                            except Exception:
+                                pass
             return ocn, None
         except Exception as e:
             return ocn, _friendly_error_message(e)
@@ -238,12 +272,29 @@ def fetch_and_save_data(ocn, fetch_holdings):
     try:
         ocn_record_bytes = fetch_marcxmldata(ocn)
         save_marcxmldata(ocn, ocn_record_bytes)
+        if reporter is not None:
+            try:
+                reporter.xml_done(ocn)
+            except Exception:
+                pass
 
         # Fetch holdings if the checkbox was selected and holdings not already fetched
-        if fetch_holdings and not os.path.exists(holdings_filepath):
-            holdings = fetch_holdingsdata(ocn)
-            if holdings:
-                save_holdingsdata(ocn, holdings)
+        if fetch_holdings:
+            if os.path.exists(holdings_filepath):
+                if reporter is not None:
+                    try:
+                        reporter.json_done(ocn)
+                    except Exception:
+                        pass
+            else:
+                holdings = fetch_holdingsdata(ocn)
+                if holdings:
+                    save_holdingsdata(ocn, holdings)
+                    if reporter is not None:
+                        try:
+                            reporter.json_done(ocn)
+                        except Exception:
+                            pass
 
         return ocn, None
 

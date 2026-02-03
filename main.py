@@ -83,9 +83,17 @@ def main():
         # When processing is active, run the long task and show progress + Stop button
         if st.session_state.get('processing', False):
             try:
-                progress_bar = st.progress(0.0, text="Starting…")
+                xml_progress_bar = st.progress(0.0, text="XML • Starting…")
             except Exception:
-                progress_bar = st.progress(0)
+                xml_progress_bar = st.progress(0)
+
+            json_progress_bar = None
+            if fetch_holdings:
+                try:
+                    json_progress_bar = st.progress(0.0, text="JSON • Starting…")
+                except Exception:
+                    json_progress_bar = st.progress(0)
+
             remaining_time_placeholder = st.empty()
             start_time = datetime.now()
             # Expose concurrency control to the user
@@ -93,7 +101,13 @@ def main():
             max_workers = st.slider("Parallel requests", 1, 32, default_workers)
 
             all_fetched, all_saved, error_list = process_data(
-                data_frame, max_workers, fetch_holdings, start_time, progress_bar, remaining_time_placeholder
+                data_frame=data_frame,
+                max_workers=max_workers,
+                fetch_holdings=fetch_holdings,
+                start_time=start_time,
+                xml_progress_bar=xml_progress_bar,
+                remaining_time_placeholder=remaining_time_placeholder,
+                json_progress_bar=json_progress_bar,
             )
 
             st.session_state.all_fetched = all_fetched

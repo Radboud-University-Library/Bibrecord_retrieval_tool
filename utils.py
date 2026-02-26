@@ -349,7 +349,13 @@ def show_export_buttons():
 
                 # Step 4: Merge XML and JSON Excel files
                 st.write("Merging exports…")
-                merge_excel_files(xml_final_filename, json_final_filename, merged_final_filename)
+                merged_final_filename = merge_excel_files(
+                    xml_final_filename,
+                    json_final_filename,
+                    merged_final_filename,
+                    fallback_csv=False,
+                    use_streaming=True,
+                )
                 status.update(label="Merged XML + JSON", state="running")
             else:
                 st.info("No JSON files found. Skipping merging step.")
@@ -365,12 +371,15 @@ def show_export_buttons():
     # Show the download button right after Step 2 export, if available
     final_name = st.session_state.get('final_export_filename')
     if st.session_state.get('export_complete') and final_name and os.path.exists(final_name):
+        _, ext = os.path.splitext(final_name)
+        mime = "text/csv" if ext.lower() == ".csv" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         with open(final_name, "rb") as file:
+            label = "Step 3: Download Final CSV" if ext.lower() == ".csv" else "Step 3: Download Final Excel"
             st.download_button(
-                label="Step 3: Download Final Excel",
+                label=label,
                 data=file,
                 file_name=final_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                mime=mime
             )
 
     # Visual separation for the ZIP action

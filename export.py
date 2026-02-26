@@ -19,6 +19,24 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import zipfile
 import json
+import re
+from openpyxl import load_workbook, Workbook
+from openpyxl.utils import get_column_letter
+
+
+def _load_single_json_object(filepath):
+    """Load a JSON file, tolerating trailing garbage after the first object."""
+    with open(filepath, 'r', encoding='utf-8') as file:
+        text = file.read()
+    try:
+        return json.loads(text), None
+    except json.JSONDecodeError:
+        # Fallback: parse the first object and ignore anything after it
+        decoder = json.JSONDecoder()
+        stripped = text.lstrip()
+        obj, idx = decoder.raw_decode(stripped)
+        trailing = stripped[idx:].strip()
+        return obj, trailing if trailing else None
 
 
 def parse_marcxml(xml_data):
@@ -122,22 +140,29 @@ def export_json_data_to_excel(json_directory, final_filename, progress_bar):
     # Process each JSON file
     for i, filename in enumerate(json_files):
         filepath = os.path.join(json_directory, filename)
-        with open(filepath, 'r', encoding='utf-8') as file:
-            json_data = json.load(file)
-            if isinstance(json_data, dict) and "holdings" in json_data:
-                base_record = {"ocn": json_data.get("ocn")}
-                holdings = json_data["holdings"]
+        try:
+            json_data, trailing = _load_single_json_object(filepath)
+        except json.JSONDecodeError as e:
+            st.warning(f"Skipping invalid JSON file: {filename} ({e})")
+            continue
 
-                # Flatten ONLY totalHoldingCount per institution
-                for holding in holdings:
-                    symbol = holding.get("institutionSymbol")
-                    if symbol is None:
-                        continue
-                    total_count = holding.get("totalHoldingCount", 0)
-                    column_name = f"totalHoldingCount_{symbol}"
-                    base_record[column_name] = total_count
+        if trailing:
+            st.warning(f"Ignoring trailing data after JSON object in {filename}")
 
-                all_data.append(base_record)
+        if isinstance(json_data, dict) and "holdings" in json_data:
+            base_record = {"ocn": json_data.get("ocn")}
+            holdings = json_data["holdings"]
+
+            # Flatten ONLY totalHoldingCount per institution
+            for holding in holdings:
+                symbol = holding.get("institutionSymbol")
+                if symbol is None:
+                    continue
+                total_count = holding.get("totalHoldingCount", 0)
+                column_name = f"totalHoldingCount_{symbol}"
+                base_record[column_name] = total_count
+
+            all_data.append(base_record)
 
         # Update progress bar
         progress_bar.progress((i + 1) / total_files, text=f"JSON {i+1}/{total_files}")
@@ -149,7 +174,117 @@ def export_json_data_to_excel(json_directory, final_filename, progress_bar):
     st.success(f"JSON data has been exported to {final_filename}")
 
 
-def merge_excel_files(xml_filename, json_filename, merged_filename):
+def _normalize_ocn(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    match = re.search(r'(\d+)', text)
+    if not match:
+        return ""
+    try:
+        return str(int(match.group(1)))
+    except Exception:
+        return match.group(1)
+
+
+def _merge_excel_files_streaming(xml_filename, json_filename, merged_filename):
+    # Build a holdings map from JSON export (ocn -> list of totalHoldingCount_* values)
+    wb_json = load_workbook(json_filename, read_only=True, data_only=True)
+    ws_json = wb_json.active
+    json_header = next(ws_json.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    if not json_header:
+        wb_json.close()
+        st.error("JSON export is empty. Cannot merge.")
+        return merged_filename
+
+    try:
+        ocn_idx = list(json_header).index("ocn")
+    except ValueError:
+        wb_json.close()
+        st.error("JSON export does not contain an 'ocn' column.")
+        return merged_filename
+
+    json_cols = [c for c in json_header if isinstance(c, str) and c.startswith("totalHoldingCount_")]
+    json_col_indices = [list(json_header).index(c) for c in json_cols]
+
+    holdings_map = {}
+    for row in ws_json.iter_rows(min_row=2, values_only=True):
+        if row is None:
+            continue
+        ocn = _normalize_ocn(row[ocn_idx] if ocn_idx < len(row) else None)
+        if not ocn:
+            continue
+        values = [row[i] if i < len(row) else None for i in json_col_indices]
+        holdings_map[ocn] = values
+    wb_json.close()
+
+    # Stream XML rows and write merged output to a new workbook
+    wb_xml = load_workbook(xml_filename, read_only=True, data_only=True)
+    ws_xml = wb_xml.active
+    xml_header = next(ws_xml.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    if not xml_header:
+        wb_xml.close()
+        st.error("XML export is empty. Cannot merge.")
+        return merged_filename
+
+    try:
+        xml_ocn_idx = list(xml_header).index("001")
+    except ValueError:
+        wb_xml.close()
+        st.error("XML export does not contain a '001' column.")
+        return merged_filename
+
+    include_sum = len(json_cols) > 0
+    sum_col_name = "totalHoldingCount_SUM"
+    out_header = list(xml_header)
+    if include_sum:
+        # Add a matched OCN column between XML and JSON for easy validation
+        out_header.append("ocn")
+        out_header.append(sum_col_name)
+        out_header.extend(json_cols)
+
+    wb_out = Workbook(write_only=True)
+    ws_out = wb_out.create_sheet(title="Sheet1")
+    ws_out.append(out_header)
+
+    # Precompute formula column letters if needed
+    if include_sum:
+        ocn_col_idx = len(xml_header) + 1
+        sum_col_idx = ocn_col_idx + 1
+        first_json_idx = sum_col_idx + 1
+        last_json_idx = first_json_idx + len(json_cols) - 1
+        first_json_letter = get_column_letter(first_json_idx)
+        last_json_letter = get_column_letter(last_json_idx)
+
+    out_row_num = 2  # header is row 1
+    for row in ws_xml.iter_rows(min_row=2, values_only=True):
+        if row is None:
+            continue
+        xml_values = list(row)
+        ocn = _normalize_ocn(xml_values[xml_ocn_idx] if xml_ocn_idx < len(xml_values) else None)
+        has_match = ocn in holdings_map
+        json_values = holdings_map.get(ocn, [None] * len(json_cols)) if include_sum else []
+
+        if include_sum:
+            # Use a formula so totals stay dynamic in Excel
+            formula = f"=SUM({first_json_letter}{out_row_num}:{last_json_letter}{out_row_num})"
+            out_row = xml_values + [ocn if has_match else ""] + [formula] + json_values
+        else:
+            out_row = xml_values
+
+        ws_out.append(out_row)
+        out_row_num += 1
+
+    wb_xml.close()
+    wb_out.save(merged_filename)
+    st.success(f"XML and JSON data have been merged and exported to {merged_filename}")
+    return merged_filename
+
+
+def merge_excel_files(xml_filename, json_filename, merged_filename, fallback_csv=True, use_streaming=False):
+    if use_streaming:
+        return _merge_excel_files_streaming(xml_filename, json_filename, merged_filename)
+
     # Read both Excel files into DataFrames
     df_xml = pd.read_excel(xml_filename, engine='openpyxl')
     df_json = pd.read_excel(json_filename, engine='openpyxl')
@@ -177,15 +312,37 @@ def merge_excel_files(xml_filename, json_filename, merged_filename):
     if json_cols_in_merged:
         # Create numeric sum as a fallback (also used by filters/pivots)
         merged_df[sum_col_name] = merged_df[json_cols_in_merged].sum(axis=1, skipna=True)
-        # Reorder columns: XML columns, then SUM, then JSON columns
+        # Reorder columns: XML columns, then matched OCN, then SUM, then JSON columns
         first_json_idx = min(merged_df.columns.get_loc(c) for c in json_cols_in_merged)
         before_json = list(merged_df.columns[:first_json_idx])
         after_json = list(merged_df.columns[first_json_idx:])
-        new_order = before_json + [sum_col_name] + [c for c in after_json if c != sum_col_name]
+
+        ocn_col = 'ocn' if 'ocn' in merged_df.columns else None
+        if ocn_col and ocn_col in before_json:
+            before_json = [c for c in before_json if c != ocn_col]
+            new_order = before_json + [ocn_col, sum_col_name] + [c for c in after_json if c != sum_col_name]
+        else:
+            new_order = before_json + [sum_col_name] + [c for c in after_json if c != sum_col_name]
+
         merged_df = merged_df.reindex(columns=new_order)
 
-    # Write the merged data to a new Excel file
-    merged_df.to_excel(merged_filename, index=False, engine='openpyxl')
+    # Write the merged data to a new Excel file (fallback to CSV on MemoryError)
+    try:
+        merged_df.to_excel(merged_filename, index=False, engine='openpyxl')
+    except MemoryError:
+        # Try streaming merge to keep XLSX output
+        try:
+            return _merge_excel_files_streaming(xml_filename, json_filename, merged_filename)
+        except Exception:
+            if not fallback_csv:
+                raise
+            csv_filename = os.path.splitext(merged_filename)[0] + ".csv"
+            merged_df.to_csv(csv_filename, index=False)
+            st.warning(
+                "Not enough memory to write Excel. Exported CSV instead: "
+                f"{csv_filename}"
+            )
+            return csv_filename
 
     # Replace SUM column values with Excel formulas so they are dynamic in Excel
     if json_cols_in_merged:
@@ -212,6 +369,7 @@ def merge_excel_files(xml_filename, json_filename, merged_filename):
             pass
 
     st.success(f"XML and JSON data have been merged and exported to {merged_filename}")
+    return merged_filename
 
 
 def save_all_xml_to_zip(xml_directory, zip_file_name):

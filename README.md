@@ -42,6 +42,7 @@ This project provides a Streamlit application for uploading a CSV file containin
     key=your_key_here
     secret=your_secret_here
     scope=WorldCatMetadataAPI
+    agent=bibrecord-retrieval-tool
     ```
 
 ## Usage

@@ -11,6 +11,7 @@ import os
 import json
 import configparser
 import threading
+import time
 
 
 def _friendly_error_message(exc) -> str:
@@ -68,8 +69,8 @@ scope = worldcat_config.get('scope')
 # Optional: custom User-Agent to identify the application to OCLC
 agent = worldcat_config.get('agent')
 
-# Insert key and secret here
-# Include agent so token requests also identify the application
+# Build token using credentials from config.ini.
+# Include agent so token requests also identify the application.
 token = WorldcatAccessToken(
     key=key,
     secret=secret,
@@ -81,6 +82,7 @@ token = WorldcatAccessToken(
 # Include 429 for rate limiting and a slightly higher backoff for stability
 SESSION_CONFIG = {
     "authorization": token,
+    "timeout": 30,
     "totalRetries": 5,
     "backoffFactor": 0.5,
     "statusForcelist": [429, 500, 502, 503, 504],
@@ -96,6 +98,28 @@ os.makedirs(HOLDINGS_DIR, exist_ok=True)
 
 # Thread-local storage for reusing a MetadataSession per worker thread
 _thread_local = threading.local()
+
+class SimpleRateLimiter:
+    """A simple thread-safe rate limiter that ensures a minimum interval between calls."""
+    def __init__(self, requests_per_second: float):
+        self.interval = 1.0 / requests_per_second if requests_per_second > 0 else 0
+        self.lock = threading.Lock()
+        self.next_allowed_time = 0.0
+
+    def wait(self):
+        if self.interval <= 0:
+            return
+        with self.lock:
+            now = time.monotonic()
+            wait_time = self.next_allowed_time - now
+            if wait_time > 0:
+                time.sleep(wait_time)
+                now = time.monotonic()
+            self.next_allowed_time = now + self.interval
+
+# API RATE LIMITER: Enforces a strict requests-per-second limit.
+# WorldCat API keys are often limited to 2 requests per second.
+API_RATE_LIMITER = SimpleRateLimiter(2.0)
 
 
 def _get_session():
@@ -119,11 +143,9 @@ def _get_session():
 def fetch_marcxmldata(ocn):
     """Fetch XML data for an OCN using the WorldCat Metadata API. Returns bytes."""
     session = _get_session()
-    # Try with timeout; if client doesn't support, fall back without
-    try:
-        response = session.bib_get(ocn, timeout=30)
-    except TypeError:
-        response = session.bib_get(ocn)
+    # Global per-key pacing gate (2 requests/second).
+    API_RATE_LIMITER.wait()
+    response = session.bib_get(ocn)
     return response.content  # bytes
 
 
@@ -138,11 +160,9 @@ def save_marcxmldata(ocn, ocn_record_bytes):
 
 
 def fetch_holdingsdata(ocn, held_by_symbols=None):
-    """Fetch general holdings for an OCN filtered by specific institution symbols.
+    """Fetch holdings for an OCN for each specific institution symbol.
 
-    Optimization: If API supports multiple heldBySymbol values at once, try a single batched
-    request by passing a list of symbols. If the response does not provide per-institution
-    counts, fall back to per-symbol requests to preserve output structure.
+    The user requires individual holdings data for each symbol.
     """
     if held_by_symbols is None:
         held_by_symbols = ['QGE', 'QGK', 'NLTUD', 'NETUE', 'QGQ', 'L2U', 'NLMAA', 'GRG', 'GRU', 'QHU', 'QGJ', 'VU@', 'WURST']
@@ -154,65 +174,36 @@ def fetch_holdingsdata(ocn, held_by_symbols=None):
 
     session = _get_session()
 
-    # Attempt batched request first (array[string] for heldBySymbol)
-    try:
-        try:
-            batched_resp = session.summary_holdings_get(
-                oclcNumber=ocn,
-                heldBySymbol=held_by_symbols,
-                timeout=30,
-            )
-        except TypeError:
-            batched_resp = session.summary_holdings_get(
-                oclcNumber=ocn,
-                heldBySymbol=held_by_symbols,
-            )
-        data = batched_resp.json()
-        # Try to detect per-institution breakdown commonly used in APIs
-        institutions = None
-        if isinstance(data, dict):
-            # Possible keys depending on API representation
-            for key in ("institutions", "holdingInstitutions", "libraries", "resultsByInstitution"):
-                if key in data and isinstance(data[key], list):
-                    institutions = data[key]
-                    break
-        if institutions is not None:
-            for inst in institutions:
-                symbol = inst.get('institutionSymbol') or inst.get('symbol') or inst.get('oclcSymbol')
-                holdings_data = {
-                    'institutionSymbol': symbol or 'UNKNOWN',
-                    'totalHoldingCount': inst.get('totalHoldingCount', data.get('totalHoldingCount', 0)),
-                    'totalSharedPrintCount': inst.get('totalSharedPrintCount', data.get('totalSharedPrintCount', 0)),
-                    'totalEditions': inst.get('totalEditions', data.get('totalEditions', 0)),
-                }
-                combined_holdings['holdings'].append(holdings_data)
-            return combined_holdings
-        # If no per-institution breakdown available, fall back to per-symbol loop
-    except Exception:
-        # On any error in batched attempt, fall back to per-symbol requests
-        pass
-
-    # Per-symbol fallback
+    # Per-symbol requests as required for individual holdings
     for symbol in held_by_symbols:
         try:
-            response = session.summary_holdings_get(
-                oclcNumber=ocn,
-                heldBySymbol=symbol,
-                timeout=30,
-            )
-        except TypeError:
+            # Global per-key pacing gate (2 requests/second).
+            API_RATE_LIMITER.wait()
             response = session.summary_holdings_get(
                 oclcNumber=ocn,
                 heldBySymbol=symbol,
             )
-        holdings = response.json()
-        holdings_data = {
-            'institutionSymbol': symbol,
-            'totalHoldingCount': holdings.get('totalHoldingCount', 0),
-            'totalSharedPrintCount': holdings.get('totalSharedPrintCount', 0),
-            'totalEditions': holdings.get('totalEditions', 0)
-        }
-        combined_holdings['holdings'].append(holdings_data)
+            holdings = response.json()
+            holdings_data = {
+                'institutionSymbol': symbol,
+                'totalHoldingCount': holdings.get('totalHoldingCount', 0),
+                'totalSharedPrintCount': holdings.get('totalSharedPrintCount', 0),
+                'totalEditions': holdings.get('totalEditions', 0)
+            }
+            combined_holdings['holdings'].append(holdings_data)
+        except Exception as e:
+            # Check for 429 rate limiting in individual requests
+            status = getattr(e, 'status_code', None) or getattr(getattr(e, 'response', None), 'status_code', None)
+            if status == 429:
+                # If we're hitting 429 even with retries, we might want to re-raise
+                # so the caller can decide whether to abort.
+                raise e
+            # Otherwise log error for this symbol and continue
+            holdings_data = {
+                'institutionSymbol': symbol,
+                'error': str(e)
+            }
+            combined_holdings['holdings'].append(holdings_data)
 
     return combined_holdings
 

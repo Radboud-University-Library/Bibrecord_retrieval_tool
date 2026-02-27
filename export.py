@@ -281,95 +281,9 @@ def _merge_excel_files_streaming(xml_filename, json_filename, merged_filename):
     return merged_filename
 
 
-def merge_excel_files(xml_filename, json_filename, merged_filename, fallback_csv=True, use_streaming=False):
-    if use_streaming:
-        return _merge_excel_files_streaming(xml_filename, json_filename, merged_filename)
-
-    # Read both Excel files into DataFrames
-    df_xml = pd.read_excel(xml_filename, engine='openpyxl')
-    df_json = pd.read_excel(json_filename, engine='openpyxl')
-
-    # Clean the '001' field in XML DataFrame
-    if '001' in df_xml.columns:
-        df_xml['001'] = df_xml['001'].astype(str).str.extract(r'(\d+)', expand=False)
-        df_xml['001'] = df_xml['001'].astype(int).astype(str)
-
-    # Clean the 'ocn' field in JSON DataFrame
-    if 'ocn' in df_json.columns:
-        df_json['ocn'] = df_json['ocn'].astype(str).astype(int).astype(str)
-
-    # Keep only totalHoldingCount_* columns from JSON along with 'ocn'
-    json_cols = [c for c in df_json.columns if c.startswith('totalHoldingCount_')]
-    keep_cols = ['ocn'] + json_cols if 'ocn' in df_json.columns else json_cols
-    df_json = df_json[keep_cols]
-
-    # Merge XML and JSON DataFrames on the '001' (from XML) and 'ocn' (from JSON)
-    merged_df = pd.merge(df_xml, df_json, left_on='001', right_on='ocn', how='left')
-
-    # Insert a per-row sum column for JSON totals placed before the JSON columns
-    json_cols_in_merged = [c for c in merged_df.columns if c.startswith('totalHoldingCount_')]
-    sum_col_name = 'totalHoldingCount_SUM'
-    if json_cols_in_merged:
-        # Create numeric sum as a fallback (also used by filters/pivots)
-        merged_df[sum_col_name] = merged_df[json_cols_in_merged].sum(axis=1, skipna=True)
-        # Reorder columns: XML columns, then matched OCN, then SUM, then JSON columns
-        first_json_idx = min(merged_df.columns.get_loc(c) for c in json_cols_in_merged)
-        before_json = list(merged_df.columns[:first_json_idx])
-        after_json = list(merged_df.columns[first_json_idx:])
-
-        ocn_col = 'ocn' if 'ocn' in merged_df.columns else None
-        if ocn_col and ocn_col in before_json:
-            before_json = [c for c in before_json if c != ocn_col]
-            new_order = before_json + [ocn_col, sum_col_name] + [c for c in after_json if c != sum_col_name]
-        else:
-            new_order = before_json + [sum_col_name] + [c for c in after_json if c != sum_col_name]
-
-        merged_df = merged_df.reindex(columns=new_order)
-
-    # Write the merged data to a new Excel file (fallback to CSV on MemoryError)
-    try:
-        merged_df.to_excel(merged_filename, index=False, engine='openpyxl')
-    except MemoryError:
-        # Try streaming merge to keep XLSX output
-        try:
-            return _merge_excel_files_streaming(xml_filename, json_filename, merged_filename)
-        except Exception:
-            if not fallback_csv:
-                raise
-            csv_filename = os.path.splitext(merged_filename)[0] + ".csv"
-            merged_df.to_csv(csv_filename, index=False)
-            st.warning(
-                "Not enough memory to write Excel. Exported CSV instead: "
-                f"{csv_filename}"
-            )
-            return csv_filename
-
-    # Replace SUM column values with Excel formulas so they are dynamic in Excel
-    if json_cols_in_merged:
-        try:
-            from openpyxl import load_workbook
-            from openpyxl.utils import get_column_letter
-            wb = load_workbook(merged_filename)
-            ws = wb.active
-            # Determine column indices for SUM and JSON columns from header row
-            headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-            sum_col_idx = headers.index(sum_col_name) + 1 if sum_col_name in headers else None
-            json_col_indices = [headers.index(c) + 1 for c in headers if c in json_cols_in_merged]
-            if sum_col_idx and json_col_indices:
-                first_data_row = 2
-                last_row = ws.max_row
-                for row in range(first_data_row, last_row + 1):
-                    # Build SUM over all JSON columns for this row
-                    refs = [f"{get_column_letter(col)}{row}" for col in json_col_indices]
-                    formula = f"=SUM({','.join(refs)})"
-                    ws.cell(row=row, column=sum_col_idx, value=formula)
-            wb.save(merged_filename)
-        except Exception:
-            # If openpyxl is unavailable or something goes wrong, keep numeric sums
-            pass
-
-    st.success(f"XML and JSON data have been merged and exported to {merged_filename}")
-    return merged_filename
+def merge_excel_files(xml_filename, json_filename, merged_filename):
+    """Merge XML + JSON exports using the streaming implementation."""
+    return _merge_excel_files_streaming(xml_filename, json_filename, merged_filename)
 
 
 def save_all_xml_to_zip(xml_directory, zip_file_name):

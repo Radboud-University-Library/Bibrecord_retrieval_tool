@@ -10,9 +10,10 @@ Functions:
 
 import streamlit as st
 import pandas as pd
-import os
 from datetime import datetime
 from utils import process_data, update_session_state, show_export_buttons, verify_required_files
+
+DEFAULT_WORKERS = 4
 
 
 def main():
@@ -96,9 +97,9 @@ def main():
 
             remaining_time_placeholder = st.empty()
             start_time = datetime.now()
-            # Expose concurrency control to the user
-            default_workers = min(10, (os.cpu_count() or 4) * 2)
-            max_workers = st.slider("Parallel requests", 1, 32, default_workers)
+            # Keep worker count small; API throughput is controlled by the global 2 req/s limiter.
+            max_workers = DEFAULT_WORKERS
+            st.caption(f"Using {max_workers} worker threads with global API pacing at 2 requests/second.")
 
             all_fetched, all_saved, error_list = process_data(
                 data_frame=data_frame,

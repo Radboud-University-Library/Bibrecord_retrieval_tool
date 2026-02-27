@@ -6,7 +6,7 @@ It includes functions for processing records, updating progress bars,
 estimating remaining time, updating session state, and displaying export buttons.
 
 Functions:
-- process_data(data_frame, max_workers, fetch_holdings, start_time, progress_bar, remaining_time_placeholder)
+- process_data(data_frame, max_workers, fetch_holdings, start_time, xml_progress_bar, remaining_time_placeholder, json_progress_bar)
 - update_session_state(all_fetched, all_saved, error_list)
 - verify_required_files(ocn_list, require_json)
 - show_export_buttons()
@@ -170,7 +170,9 @@ def process_data(data_frame, max_workers, fetch_holdings, start_time, xml_progre
 
     # Submit tasks
     ocns = data_frame['OCLC Number'].astype(str).tolist()
-    executor = ThreadPoolExecutor(max_workers=max_workers)
+    # Small worker pools are enough for I/O pipelining when API calls are globally rate-limited.
+    bounded_workers = max(1, min(int(max_workers), 6))
+    executor = ThreadPoolExecutor(max_workers=bounded_workers)
     executor_shutdown = False
     try:
         futures = {executor.submit(fetch_and_save_data, ocn, fetch_holdings, reporter): ocn for ocn in ocns}
@@ -190,6 +192,10 @@ def process_data(data_frame, max_workers, fetch_holdings, start_time, xml_progre
                     error_list.append(f"OCN {ocn}: {error}")
                     all_fetched = False
                     all_saved = False
+                    # Stop if we hit rate limits (429) consistently or as an exit strategy
+                    if "429" in str(error) or "Rate limited" in str(error):
+                        st.session_state.stop = True
+                        st.warning("Rate limit reached. Stopping further requests to avoid lockout.")
             except Exception as e:
                 error_list.append(f"OCN {ocn}: {e}")
                 all_fetched = False
@@ -263,7 +269,7 @@ def update_session_state(all_fetched, all_saved, error_list):
             for entry in error_list:
                 try:
                     # Split on the first colon to isolate the reason part
-                    prefix, reason = entry.split(":", 1)
+                    _, reason = entry.split(":", 1)
                     reason = reason.strip()
                 except ValueError:
                     reason = entry.strip()
@@ -353,8 +359,6 @@ def show_export_buttons():
                     xml_final_filename,
                     json_final_filename,
                     merged_final_filename,
-                    fallback_csv=False,
-                    use_streaming=True,
                 )
                 status.update(label="Merged XML + JSON", state="running")
             else:
@@ -371,12 +375,10 @@ def show_export_buttons():
     # Show the download button right after Step 2 export, if available
     final_name = st.session_state.get('final_export_filename')
     if st.session_state.get('export_complete') and final_name and os.path.exists(final_name):
-        _, ext = os.path.splitext(final_name)
-        mime = "text/csv" if ext.lower() == ".csv" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         with open(final_name, "rb") as file:
-            label = "Step 3: Download Final CSV" if ext.lower() == ".csv" else "Step 3: Download Final Excel"
             st.download_button(
-                label=label,
+                label="Step 3: Download Final Excel",
                 data=file,
                 file_name=final_name,
                 mime=mime

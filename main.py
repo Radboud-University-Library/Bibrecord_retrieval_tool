@@ -13,7 +13,7 @@ import pandas as pd
 from datetime import datetime
 from utils import process_data, update_session_state, show_export_buttons, verify_required_files
 
-DEFAULT_WORKERS = 4
+DEFAULT_WORKERS = 5
 
 
 def main():
@@ -146,7 +146,6 @@ def main():
                 with st.expander(f"Missing JSON holdings for {len(missing_json)} OCN(s)", expanded=False):
                     st.write(", ".join(missing_json))
             st.info("Please fetch missing records before proceeding to Step 2.")
-
 
 if __name__ == "__main__":
     main()

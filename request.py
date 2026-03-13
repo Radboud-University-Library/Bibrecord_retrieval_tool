@@ -118,7 +118,7 @@ class SimpleRateLimiter:
             self.next_allowed_time = now + self.interval
 
 # API RATE LIMITER: Enforces a strict requests-per-second limit.
-# WorldCat API keys are often limited to 2 requests per second.
+# WorldCat API keys are limited to 2 requests per second.
 API_RATE_LIMITER = SimpleRateLimiter(2.0)
 
 

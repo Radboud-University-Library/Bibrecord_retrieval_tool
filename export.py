@@ -21,7 +21,7 @@ import zipfile
 import json
 import re
 from openpyxl import load_workbook, Workbook
-from openpyxl.utils import get_column_letter
+from openpyxl.cell import WriteOnlyCell
 
 
 def _load_single_json_object(filepath):
@@ -70,6 +70,27 @@ def parse_marcxml(xml_data):
     return all_records
 
 
+def _excel_safe_value(value, empty_as_none: bool = False):
+    if empty_as_none and value == "":
+        return None
+    if isinstance(value, (list, dict, tuple, set)):
+        return str(value)
+    return value
+
+
+def _to_excel_cell(worksheet, value, empty_as_none: bool = False):
+    value = _excel_safe_value(value, empty_as_none=empty_as_none)
+    if value is None:
+        return None
+
+    if isinstance(value, str) and value.startswith("="):
+        cell = WriteOnlyCell(worksheet, value=value)
+        cell.data_type = "s"
+        return cell
+
+    return value
+
+
 def export_xml_data_to_excel(xml_directory, final_filename, progress_bar):
 
     if not os.path.exists(xml_directory):
@@ -82,7 +103,6 @@ def export_xml_data_to_excel(xml_directory, final_filename, progress_bar):
         return
 
     total_files = len(xml_files)
-    chunk_size = 5000
 
     # First pass: determine the complete set of columns across all files
     all_columns = set()
@@ -96,30 +116,25 @@ def export_xml_data_to_excel(xml_directory, final_filename, progress_bar):
     # Fix the order of columns (for example, sorted alphabetically)
     all_columns = sorted(all_columns)
 
-    # Second pass: process the XML files in chunks with a consistent column order
-    for i in range(0, total_files, chunk_size):
-        chunk_data = []
-        chunk = xml_files[i:i + chunk_size]
-        for filename in chunk:
-            filepath = os.path.join(xml_directory, filename)
-            with open(filepath, 'r', encoding='utf-8') as file:
-                xml_data = file.read()
-                parsed_data = parse_marcxml(xml_data)
-                chunk_data.extend(parsed_data)
+    workbook = Workbook(write_only=True)
+    worksheet = workbook.create_sheet(title="Sheet1")
+    worksheet.append(all_columns)
 
-        # Create DataFrame and reindex using the pre-determined column order
-        df = pd.DataFrame(chunk_data)
-        df = df.reindex(columns=all_columns)  # This ensures consistent alignment
+    for i, filename in enumerate(xml_files, start=1):
+        filepath = os.path.join(xml_directory, filename)
+        with open(filepath, 'r', encoding='utf-8') as file:
+            xml_data = file.read()
+            parsed_data = parse_marcxml(xml_data)
+            for record in parsed_data:
+                worksheet.append([
+                    _to_excel_cell(worksheet, record.get(column, ""), empty_as_none=True)
+                    for column in all_columns
+                ])
 
-        # Write the data to the final Excel file
-        if i == 0:  # For the first chunk, create a new file with header
-            df.to_excel(final_filename, index=False, engine='openpyxl')
-        else:  # For subsequent chunks, append to the existing sheet
-            with pd.ExcelWriter(final_filename, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
-                startrow = writer.book['Sheet1'].max_row
-                df.to_excel(writer, index=False, header=False, startrow=startrow)
+        progress_bar.progress(i / total_files, text=f"XML {i}/{total_files}")
 
-        progress_bar.progress((i + len(chunk)) / total_files, text=f"XML {min(i+len(chunk), total_files)}/{total_files}")
+    workbook.save(final_filename)
+    workbook.close()
 
     st.success(f"XML data has been exported to {final_filename}")
 
@@ -169,7 +184,17 @@ def export_json_data_to_excel(json_directory, final_filename, progress_bar):
 
     # Write the flattened JSON data to the final Excel file
     df = pd.DataFrame(all_data)
-    df.to_excel(final_filename, index=False, engine='openpyxl')
+    header = list(df.columns)
+    workbook = Workbook(write_only=True)
+    worksheet = workbook.create_sheet(title="Sheet1")
+    worksheet.append(header)
+    for _, row in df.iterrows():
+        worksheet.append([
+            _to_excel_cell(worksheet, None if pd.isna(value) else value, empty_as_none=True)
+            for value in row.tolist()
+        ])
+    workbook.save(final_filename)
+    workbook.close()
 
     st.success(f"JSON data has been exported to {final_filename}")
 
@@ -247,15 +272,6 @@ def _merge_excel_files_streaming(xml_filename, json_filename, merged_filename):
     ws_out = wb_out.create_sheet(title="Sheet1")
     ws_out.append(out_header)
 
-    # Precompute formula column letters if needed
-    if include_sum:
-        ocn_col_idx = len(xml_header) + 1
-        sum_col_idx = ocn_col_idx + 1
-        first_json_idx = sum_col_idx + 1
-        last_json_idx = first_json_idx + len(json_cols) - 1
-        first_json_letter = get_column_letter(first_json_idx)
-        last_json_letter = get_column_letter(last_json_idx)
-
     out_row_num = 2  # header is row 1
     for row in ws_xml.iter_rows(min_row=2, values_only=True):
         if row is None:
@@ -266,17 +282,20 @@ def _merge_excel_files_streaming(xml_filename, json_filename, merged_filename):
         json_values = holdings_map.get(ocn, [None] * len(json_cols)) if include_sum else []
 
         if include_sum:
-            # Use a formula so totals stay dynamic in Excel
-            formula = f"=SUM({first_json_letter}{out_row_num}:{last_json_letter}{out_row_num})"
-            out_row = xml_values + [ocn if has_match else ""] + [formula] + json_values
+            total_holdings = sum(value for value in json_values if isinstance(value, (int, float)))
+            out_row = xml_values + [ocn if has_match else None] + [total_holdings] + json_values
         else:
             out_row = xml_values
 
-        ws_out.append(out_row)
+        ws_out.append([
+            _to_excel_cell(ws_out, value, empty_as_none=True)
+            for value in out_row
+        ])
         out_row_num += 1
 
     wb_xml.close()
     wb_out.save(merged_filename)
+    wb_out.close()
     st.success(f"XML and JSON data have been merged and exported to {merged_filename}")
     return merged_filename
 

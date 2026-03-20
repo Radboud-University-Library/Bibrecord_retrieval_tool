@@ -12,6 +12,7 @@ import json
 import configparser
 import threading
 import time
+from worldcat_quota import WorldCatDailyQuotaError, reserve_requests
 
 
 def _friendly_error_message(exc) -> str:
@@ -29,6 +30,9 @@ def _friendly_error_message(exc) -> str:
 
     msg = str(exc) if exc else ""
     low = msg.lower()
+
+    if isinstance(exc, WorldCatDailyQuotaError):
+        return msg
 
     if status is not None:
         if status == 401:
@@ -122,6 +126,12 @@ class SimpleRateLimiter:
 API_RATE_LIMITER = SimpleRateLimiter(2.0)
 
 
+def _prepare_api_call():
+    """Apply both short-term pacing and the persisted daily quota gate."""
+    API_RATE_LIMITER.wait()
+    reserve_requests(1)
+
+
 def _get_session():
     """Return a thread-local MetadataSession instance for connection reuse."""
     session = getattr(_thread_local, 'session', None)
@@ -144,7 +154,7 @@ def fetch_marcxmldata(ocn):
     """Fetch XML data for an OCN using the WorldCat Metadata API. Returns bytes."""
     session = _get_session()
     # Global per-key pacing gate (2 requests/second).
-    API_RATE_LIMITER.wait()
+    _prepare_api_call()
     response = session.bib_get(ocn)
     return response.content  # bytes
 
@@ -178,7 +188,7 @@ def fetch_holdingsdata(ocn, held_by_symbols=None):
     for symbol in held_by_symbols:
         try:
             # Global per-key pacing gate (2 requests/second).
-            API_RATE_LIMITER.wait()
+            _prepare_api_call()
             response = session.summary_holdings_get(
                 oclcNumber=ocn,
                 heldBySymbol=symbol,
@@ -193,6 +203,8 @@ def fetch_holdingsdata(ocn, held_by_symbols=None):
             combined_holdings['holdings'].append(holdings_data)
         except Exception as e:
             # Check for 429 rate limiting in individual requests
+            if isinstance(e, WorldCatDailyQuotaError):
+                raise e
             status = getattr(e, 'status_code', None) or getattr(getattr(e, 'response', None), 'status_code', None)
             if status == 429:
                 # If we're hitting 429 even with retries, we might want to re-raise

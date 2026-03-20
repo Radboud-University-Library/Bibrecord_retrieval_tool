@@ -11,7 +11,13 @@ Functions:
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from utils import process_data, update_session_state, show_export_buttons, verify_required_files
+from utils import (
+    process_data,
+    render_worldcat_usage,
+    show_export_buttons,
+    update_session_state,
+    verify_required_files,
+)
 
 DEFAULT_WORKERS = 5
 
@@ -19,6 +25,8 @@ DEFAULT_WORKERS = 5
 def main():
     """Main function to set up the Streamlit interface and handle user interactions."""
     st.title("Bibrecord Retrieval Tool")
+    usage_placeholder = st.empty()
+    usage_snapshot = render_worldcat_usage(usage_placeholder)
 
     # Upload CSV file
     uploaded_file = st.file_uploader("Upload a CSV file", type="csv")
@@ -61,7 +69,10 @@ def main():
 
         col1, col2 = st.columns(2)
         with col1:
-            start_clicked = st.button("Step 1: Fetch Records", disabled=st.session_state.get('processing', False))
+            start_clicked = st.button(
+                "Step 1: Fetch Records",
+                disabled=st.session_state.get('processing', False) or usage_snapshot.get('is_exhausted', False),
+            )
         with col2:
             if st.session_state.get('processing', False):
                 if st.button("Stop"):
@@ -109,6 +120,7 @@ def main():
                 xml_progress_bar=xml_progress_bar,
                 remaining_time_placeholder=remaining_time_placeholder,
                 json_progress_bar=json_progress_bar,
+                usage_placeholder=usage_placeholder,
             )
 
             st.session_state.all_fetched = all_fetched
@@ -117,6 +129,7 @@ def main():
             # Mark processing ended
             st.session_state.processing = False
 
+            render_worldcat_usage(usage_placeholder)
             update_session_state(all_fetched, all_saved, error_list)
 
     # Show export buttons only if all required files are present for all OCNs

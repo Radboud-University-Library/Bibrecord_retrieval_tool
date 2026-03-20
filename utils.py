@@ -20,6 +20,7 @@ from datetime import datetime
 from request import fetch_and_save_data
 from export import export_xml_data_to_excel, export_json_data_to_excel, merge_excel_files, save_all_xml_to_zip
 import queue
+from worldcat_quota import get_usage_snapshot
 
 
 def _format_eta(seconds: float) -> str:
@@ -50,7 +51,45 @@ class ProgressReporter:
         return out
 
 
-def process_data(data_frame, max_workers, fetch_holdings, start_time, xml_progress_bar, remaining_time_placeholder, json_progress_bar=None):
+def render_worldcat_usage(placeholder=None):
+    """Render the persisted WorldCat daily quota usage panel."""
+    snapshot = get_usage_snapshot()
+    target = placeholder.container() if placeholder is not None else st.container()
+
+    with target:
+        st.caption("WorldCat API usage today")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Used", f"{snapshot['requests_used']:,}")
+        col2.metric("Remaining", f"{snapshot['requests_remaining']:,}")
+        col3.metric("Daily limit", f"{snapshot['daily_limit']:,}")
+        try:
+            st.progress(
+                float(snapshot["usage_ratio"]),
+                text=f"{snapshot['requests_used']:,} of {snapshot['daily_limit']:,} requests used today",
+            )
+        except Exception:
+            st.progress(float(snapshot["usage_ratio"]))
+
+        if snapshot["is_exhausted"]:
+            st.warning("The daily WorldCat quota has been reached. Fetching is disabled until after local midnight.")
+        elif snapshot["requests_remaining"] <= 5000:
+            st.warning("The WorldCat daily quota is getting low.")
+        else:
+            st.info("Usage persists on disk between Streamlit launches and resets automatically after local midnight.")
+
+    return snapshot
+
+
+def process_data(
+    data_frame,
+    max_workers,
+    fetch_holdings,
+    start_time,
+    xml_progress_bar,
+    remaining_time_placeholder,
+    json_progress_bar=None,
+    usage_placeholder=None,
+):
     """
     Process records concurrently and update two progress bars:
     - XML bar (always shown)
@@ -145,6 +184,9 @@ def process_data(data_frame, max_workers, fetch_holdings, start_time, xml_progre
             except Exception:
                 xml_progress_bar.progress(frac)
 
+        if usage_placeholder is not None:
+            render_worldcat_usage(usage_placeholder)
+
     def push_json_progress(force=False, final=False):
         if not fetch_holdings or json_progress_bar is None:
             return
@@ -193,9 +235,16 @@ def process_data(data_frame, max_workers, fetch_holdings, start_time, xml_progre
                     all_fetched = False
                     all_saved = False
                     # Stop if we hit rate limits (429) consistently or as an exit strategy
-                    if "429" in str(error) or "Rate limited" in str(error):
+                    if (
+                        "429" in str(error)
+                        or "Rate limited" in str(error)
+                        or "Daily WorldCat quota reached" in str(error)
+                    ):
                         st.session_state.stop = True
-                        st.warning("Rate limit reached. Stopping further requests to avoid lockout.")
+                        if "Daily WorldCat quota reached" in str(error):
+                            st.warning("Daily quota reached. Stopping further requests until after local midnight.")
+                        else:
+                            st.warning("Rate limit reached. Stopping further requests to avoid lockout.")
             except Exception as e:
                 error_list.append(f"OCN {ocn}: {e}")
                 all_fetched = False

@@ -1,0 +1,4 @@
+[server]
+address = "localhost"
+headless = true
+port = 8503

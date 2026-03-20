@@ -43,10 +43,10 @@ def _build_default_state(now: datetime | None = None) -> dict:
     }
 
 
-def _read_state(now: datetime | None = None) -> dict:
+def _read_state(now: datetime | None = None) -> tuple[dict, bool]:
     state = _build_default_state(now)
     if not os.path.exists(USAGE_FILEPATH):
-        return state
+        return state, True
 
     try:
         with open(USAGE_FILEPATH, "r", encoding="utf-8") as handle:
@@ -54,16 +54,16 @@ def _read_state(now: datetime | None = None) -> dict:
         if isinstance(loaded, dict):
             state.update(loaded)
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return state
+        return state, True
 
     current = _local_now(now)
     if state.get("date") != current.date().isoformat():
-        return _build_default_state(current)
+        return _build_default_state(current), True
 
     state["daily_limit"] = DAILY_REQUEST_LIMIT
     state["requests_used"] = max(0, int(state.get("requests_used", 0)))
     state["last_updated"] = state.get("last_updated") or current.isoformat()
-    return state
+    return state, False
 
 
 def _write_state(state: dict) -> None:
@@ -127,8 +127,9 @@ def _snapshot_from_state(state: dict) -> dict:
 def get_usage_snapshot(now: datetime | None = None) -> dict:
     """Return the persisted usage state for the current local day."""
     with _locked_state_file():
-        state = _read_state(now)
-        _write_state(state)
+        state, should_persist = _read_state(now)
+        if should_persist:
+            _write_state(state)
         return _snapshot_from_state(state)
 
 
@@ -138,7 +139,7 @@ def reserve_requests(count: int = 1, now: datetime | None = None) -> dict:
         return get_usage_snapshot(now)
 
     with _locked_state_file():
-        state = _read_state(now)
+        state, _ = _read_state(now)
         used = int(state.get("requests_used", 0))
         new_total = used + int(count)
         if new_total > DAILY_REQUEST_LIMIT:

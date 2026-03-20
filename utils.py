@@ -15,9 +15,10 @@ Functions:
 import time
 import os
 import streamlit as st
-from concurrent.futures import as_completed, ThreadPoolExecutor
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
-from request import fetch_and_save_data
+from request import UserStopRequestedError, fetch_and_save_data
 from export import export_xml_data_to_excel, export_json_data_to_excel, merge_excel_files, save_all_xml_to_zip
 import queue
 from worldcat_quota import get_usage_snapshot
@@ -89,6 +90,7 @@ def process_data(
     remaining_time_placeholder,
     json_progress_bar=None,
     usage_placeholder=None,
+    stop_event=None,
 ):
     """
     Process records concurrently and update two progress bars:
@@ -139,6 +141,10 @@ def process_data(
     all_fetched = True
     all_saved = True
     error_list = []
+    stopped_by_user = False
+
+    if stop_event is None:
+        stop_event = threading.Event()
 
     # EMA state for XML ETA
     ema_tau = 0.2
@@ -147,12 +153,44 @@ def process_data(
     # Debounce settings
     last_ui_update = 0.0
     min_update_interval = 0.25
+    last_usage_update = 0.0
+    usage_update_interval = 0.25
 
     # Sub-step counters
     xml_completed = 0
     json_completed = 0
 
     reporter = ProgressReporter()
+
+    def apply_reporter_events(max_items: int = 100):
+        nonlocal xml_completed, json_completed, ema_sec_per_item
+        changed = False
+        for (kind, _ocn_evt) in reporter.drain(max_items):
+            if kind == "xml":
+                xml_completed += 1
+                changed = True
+            elif kind == "json":
+                json_completed += 1
+                changed = True
+
+        if changed and xml_completed > 0:
+            curr_sec_per_item = (datetime.now() - start_time).total_seconds() / max(1, xml_completed)
+            if ema_sec_per_item is None:
+                ema_sec_per_item = curr_sec_per_item
+            else:
+                ema_sec_per_item = (1 - ema_tau) * ema_sec_per_item + ema_tau * curr_sec_per_item
+
+        return changed
+
+    def push_usage(force=False):
+        nonlocal last_usage_update
+        if usage_placeholder is None:
+            return
+        now = time.time()
+        if not force and (now - last_usage_update) < usage_update_interval:
+            return
+        last_usage_update = now
+        render_worldcat_usage(usage_placeholder)
 
     def push_xml_progress(force=False, final=False):
         nonlocal last_ui_update
@@ -175,17 +213,18 @@ def process_data(
 
         if final:
             try:
-                xml_progress_bar.progress(1.0, text=f"XML • 100% • {xml_total}/{xml_total} • Done")
+                if stopped_by_user:
+                    xml_progress_bar.progress(frac, text=f"XML • {int(frac*100)}% • {xml_completed}/{xml_total} • Stopped")
+                else:
+                    xml_progress_bar.progress(1.0, text=f"XML • 100% • {xml_total}/{xml_total} • Done")
             except Exception:
-                xml_progress_bar.progress(1.0)
+                xml_progress_bar.progress(frac if stopped_by_user else 1.0)
         else:
             try:
                 xml_progress_bar.progress(frac, text=text)
             except Exception:
                 xml_progress_bar.progress(frac)
-
-        if usage_placeholder is not None:
-            render_worldcat_usage(usage_placeholder)
+        push_usage(force=force or final)
 
     def push_json_progress(force=False, final=False):
         if not fetch_holdings or json_progress_bar is None:
@@ -193,9 +232,12 @@ def process_data(
         frac = json_completed / max(1, json_total)
         if final:
             try:
-                json_progress_bar.progress(1.0, text=f"JSON • 100% • {json_total}/{json_total} • Done")
+                if stopped_by_user:
+                    json_progress_bar.progress(frac, text=f"JSON • {int(frac*100)}% • {json_completed}/{json_total} • Stopped")
+                else:
+                    json_progress_bar.progress(1.0, text=f"JSON • 100% • {json_total}/{json_total} • Done")
             except Exception:
-                json_progress_bar.progress(1.0)
+                json_progress_bar.progress(frac if stopped_by_user else 1.0)
             return
         try:
             json_progress_bar.progress(frac, text=f"JSON • {int(frac*100)}% • {json_completed}/{json_total}")
@@ -204,6 +246,7 @@ def process_data(
 
     # Initial paints
     push_xml_progress(force=True)
+    push_usage(force=True)
     if fetch_holdings and json_progress_bar is not None:
         try:
             json_progress_bar.progress(0.0, text=f"JSON • Starting… 0/{json_total}")
@@ -217,57 +260,87 @@ def process_data(
     executor = ThreadPoolExecutor(max_workers=bounded_workers)
     executor_shutdown = False
     try:
-        futures = {executor.submit(fetch_and_save_data, ocn, fetch_holdings, reporter): ocn for ocn in ocns}
-        for future in as_completed(futures):
+        ocn_iter = iter(ocns)
+        futures = {}
+
+        def submit_next():
+            if stop_event.is_set():
+                return False
+            try:
+                next_ocn = next(ocn_iter)
+            except StopIteration:
+                return False
+            future = executor.submit(fetch_and_save_data, next_ocn, fetch_holdings, reporter, stop_event)
+            futures[future] = next_ocn
+            return True
+
+        for _ in range(min(bounded_workers, len(ocns))):
+            if not submit_next():
+                break
+
+        while futures:
             if st.session_state.get('stop'):
+                stop_event.set()
+
+            if stop_event.is_set():
+                stopped_by_user = True
                 try:
-                    executor.shutdown(cancel_futures=True)
+                    executor.shutdown(wait=False, cancel_futures=True)
                     executor_shutdown = True
                 except Exception:
                     pass
-                break
+                for pending_future in list(futures):
+                    if pending_future.cancel():
+                        futures.pop(pending_future, None)
+                if not futures:
+                    break
 
-            ocn = futures[future]
-            try:
-                ocn, error = future.result()
-                if error:
-                    error_list.append(f"OCN {ocn}: {error}")
+            done, _ = wait(list(futures.keys()), timeout=0.1, return_when=FIRST_COMPLETED)
+            if not done:
+                reporter_changed = apply_reporter_events()
+                if reporter_changed:
+                    push_xml_progress()
+                    push_json_progress()
+                else:
+                    push_usage()
+                continue
+
+            for future in done:
+                ocn = futures.pop(future)
+                try:
+                    ocn, error = future.result()
+                    if error and "Fetching stopped by user." not in str(error):
+                        error_list.append(f"OCN {ocn}: {error}")
+                        all_fetched = False
+                        all_saved = False
+                        # Stop if we hit rate limits (429) consistently or as an exit strategy
+                        if (
+                            "429" in str(error)
+                            or "Rate limited" in str(error)
+                            or "Daily WorldCat quota reached" in str(error)
+                        ):
+                            st.session_state.stop = True
+                            stop_event.set()
+                            if "Daily WorldCat quota reached" in str(error):
+                                st.warning("Daily quota reached. Stopping further requests until after local midnight.")
+                            else:
+                                st.warning("Rate limit reached. Stopping further requests to avoid lockout.")
+                except UserStopRequestedError:
+                    stopped_by_user = True
+                except Exception as e:
+                    error_list.append(f"OCN {ocn}: {e}")
                     all_fetched = False
                     all_saved = False
-                    # Stop if we hit rate limits (429) consistently or as an exit strategy
-                    if (
-                        "429" in str(error)
-                        or "Rate limited" in str(error)
-                        or "Daily WorldCat quota reached" in str(error)
-                    ):
-                        st.session_state.stop = True
-                        if "Daily WorldCat quota reached" in str(error):
-                            st.warning("Daily quota reached. Stopping further requests until after local midnight.")
-                        else:
-                            st.warning("Rate limit reached. Stopping further requests to avoid lockout.")
-            except Exception as e:
-                error_list.append(f"OCN {ocn}: {e}")
-                all_fetched = False
-                all_saved = False
 
-            # Drain events accumulated so far
-            for (kind, _ocn_evt) in reporter.drain():
-                if kind == "xml":
-                    xml_completed += 1
-                elif kind == "json":
-                    json_completed += 1
+                if not stop_event.is_set():
+                    submit_next()
 
-            # Update EMA based on XML progress
-            if xml_completed > 0:
-                curr_sec_per_item = (datetime.now() - start_time).total_seconds() / max(1, xml_completed)
-                if ema_sec_per_item is None:
-                    ema_sec_per_item = curr_sec_per_item
+                reporter_changed = apply_reporter_events()
+                if reporter_changed:
+                    push_xml_progress()
+                    push_json_progress()
                 else:
-                    ema_sec_per_item = (1 - ema_tau) * ema_sec_per_item + ema_tau * curr_sec_per_item
-
-            # Debounced UI updates
-            push_xml_progress()
-            push_json_progress()
+                    push_usage()
     finally:
         if not executor_shutdown:
             try:
@@ -275,16 +348,18 @@ def process_data(
             except Exception:
                 pass
         # Drain any remaining events
-        for (kind, _ocn_evt) in reporter.drain(100000):
-            if kind == "xml":
-                xml_completed += 1
-            elif kind == "json":
-                json_completed += 1
+        apply_reporter_events(100000)
         # Final updates
         push_xml_progress(force=True, final=True)
         if fetch_holdings and json_progress_bar is not None:
             push_json_progress(final=True)
+        push_usage(force=True)
         remaining_time_placeholder.empty()
+
+    if stopped_by_user:
+        all_fetched = False
+        all_saved = False
+        st.info("Fetching stopped by user. In-flight requests were allowed to wind down, but new requests were blocked as quickly as possible.")
 
     return all_fetched, all_saved, error_list
 

@@ -15,6 +15,10 @@ import time
 from worldcat_quota import WorldCatDailyQuotaError, reserve_requests
 
 
+class UserStopRequestedError(RuntimeError):
+    """Raised when the user asks the current fetch run to stop."""
+
+
 def _friendly_error_message(exc) -> str:
     """Return a concise, user-friendly reason for a failed fetch.
 
@@ -32,6 +36,8 @@ def _friendly_error_message(exc) -> str:
     low = msg.lower()
 
     if isinstance(exc, WorldCatDailyQuotaError):
+        return msg
+    if isinstance(exc, UserStopRequestedError):
         return msg
 
     if status is not None:
@@ -110,15 +116,19 @@ class SimpleRateLimiter:
         self.lock = threading.Lock()
         self.next_allowed_time = 0.0
 
-    def wait(self):
+    def wait(self, stop_event=None):
         if self.interval <= 0:
             return
         with self.lock:
             now = time.monotonic()
             wait_time = self.next_allowed_time - now
-            if wait_time > 0:
-                time.sleep(wait_time)
+            while wait_time > 0:
+                if stop_event is not None and stop_event.is_set():
+                    raise UserStopRequestedError("Fetching stopped by user.")
+                sleep_chunk = min(wait_time, 0.1)
+                time.sleep(sleep_chunk)
                 now = time.monotonic()
+                wait_time = self.next_allowed_time - now
             self.next_allowed_time = now + self.interval
 
 # API RATE LIMITER: Enforces a strict requests-per-second limit.
@@ -126,9 +136,16 @@ class SimpleRateLimiter:
 API_RATE_LIMITER = SimpleRateLimiter(2.0)
 
 
-def _prepare_api_call():
+def _check_stop_requested(stop_event=None):
+    if stop_event is not None and stop_event.is_set():
+        raise UserStopRequestedError("Fetching stopped by user.")
+
+
+def _prepare_api_call(stop_event=None):
     """Apply both short-term pacing and the persisted daily quota gate."""
-    API_RATE_LIMITER.wait()
+    _check_stop_requested(stop_event)
+    API_RATE_LIMITER.wait(stop_event=stop_event)
+    _check_stop_requested(stop_event)
     reserve_requests(1)
 
 
@@ -150,11 +167,11 @@ def _get_session():
     return session
 
 
-def fetch_marcxmldata(ocn):
+def fetch_marcxmldata(ocn, stop_event=None):
     """Fetch XML data for an OCN using the WorldCat Metadata API. Returns bytes."""
     session = _get_session()
     # Global per-key pacing gate (2 requests/second).
-    _prepare_api_call()
+    _prepare_api_call(stop_event=stop_event)
     response = session.bib_get(ocn)
     return response.content  # bytes
 
@@ -169,7 +186,7 @@ def save_marcxmldata(ocn, ocn_record_bytes):
         file.write(ocn_record_bytes)
 
 
-def fetch_holdingsdata(ocn, held_by_symbols=None):
+def fetch_holdingsdata(ocn, held_by_symbols=None, stop_event=None):
     """Fetch holdings for an OCN for each specific institution symbol.
 
     The user requires individual holdings data for each symbol.
@@ -187,8 +204,9 @@ def fetch_holdingsdata(ocn, held_by_symbols=None):
     # Per-symbol requests as required for individual holdings
     for symbol in held_by_symbols:
         try:
+            _check_stop_requested(stop_event)
             # Global per-key pacing gate (2 requests/second).
-            _prepare_api_call()
+            _prepare_api_call(stop_event=stop_event)
             response = session.summary_holdings_get(
                 oclcNumber=ocn,
                 heldBySymbol=symbol,
@@ -204,6 +222,8 @@ def fetch_holdingsdata(ocn, held_by_symbols=None):
         except Exception as e:
             # Check for 429 rate limiting in individual requests
             if isinstance(e, WorldCatDailyQuotaError):
+                raise e
+            if isinstance(e, UserStopRequestedError):
                 raise e
             status = getattr(e, 'status_code', None) or getattr(getattr(e, 'response', None), 'status_code', None)
             if status == 429:
@@ -231,7 +251,7 @@ def save_holdingsdata(ocn, holdings_data):
         json.dump(holdings_data, file, ensure_ascii=False)
 
 
-def fetch_and_save_data(ocn, fetch_holdings, reporter=None):
+def fetch_and_save_data(ocn, fetch_holdings, reporter=None, stop_event=None):
     """
     Fetch and save the record with the given OCN and optionally fetch holdings.
     Uses the functions above. Reports sub-step completion via `reporter` if provided.
@@ -240,6 +260,7 @@ def fetch_and_save_data(ocn, fetch_holdings, reporter=None):
     # Precompute target filepaths using constants
     xml_filepath = os.path.join(REQUESTED_DIR, f'{ocn}.xml')
     holdings_filepath = os.path.join(HOLDINGS_DIR, f'{ocn}_holdings.json')
+    _check_stop_requested(stop_event)
 
     # If XML already exists, we can still fetch holdings if requested
     if os.path.exists(xml_filepath):
@@ -259,7 +280,8 @@ def fetch_and_save_data(ocn, fetch_holdings, reporter=None):
                         except Exception:
                             pass
                 else:
-                    holdings = fetch_holdingsdata(ocn)
+                    _check_stop_requested(stop_event)
+                    holdings = fetch_holdingsdata(ocn, stop_event=stop_event)
                     if holdings:
                         save_holdingsdata(ocn, holdings)
                         if reporter is not None:
@@ -273,7 +295,8 @@ def fetch_and_save_data(ocn, fetch_holdings, reporter=None):
 
     # Fetch the record and save it to the requested folder
     try:
-        ocn_record_bytes = fetch_marcxmldata(ocn)
+        _check_stop_requested(stop_event)
+        ocn_record_bytes = fetch_marcxmldata(ocn, stop_event=stop_event)
         save_marcxmldata(ocn, ocn_record_bytes)
         if reporter is not None:
             try:
@@ -290,7 +313,8 @@ def fetch_and_save_data(ocn, fetch_holdings, reporter=None):
                     except Exception:
                         pass
             else:
-                holdings = fetch_holdingsdata(ocn)
+                _check_stop_requested(stop_event)
+                holdings = fetch_holdingsdata(ocn, stop_event=stop_event)
                 if holdings:
                     save_holdingsdata(ocn, holdings)
                     if reporter is not None:

@@ -10,6 +10,7 @@ Functions:
 
 import streamlit as st
 import pandas as pd
+import threading
 from datetime import datetime
 from utils import (
     process_data,
@@ -18,6 +19,7 @@ from utils import (
     update_session_state,
     verify_required_files,
 )
+from worldcat_quota import get_usage_snapshot
 
 DEFAULT_WORKERS = 5
 
@@ -25,8 +27,6 @@ DEFAULT_WORKERS = 5
 def main():
     """Main function to set up the Streamlit interface and handle user interactions."""
     st.title("Bibrecord Retrieval Tool")
-    usage_placeholder = st.empty()
-    usage_snapshot = render_worldcat_usage(usage_placeholder)
 
     # Upload CSV file
     uploaded_file = st.file_uploader("Upload a CSV file", type="csv")
@@ -66,6 +66,10 @@ def main():
         # Initialize processing flag if not present
         if 'processing' not in st.session_state:
             st.session_state.processing = False
+        if 'stop_event' not in st.session_state:
+            st.session_state.stop_event = None
+
+        usage_snapshot = get_usage_snapshot()
 
         col1, col2 = st.columns(2)
         with col1:
@@ -77,6 +81,9 @@ def main():
             if st.session_state.get('processing', False):
                 if st.button("Stop"):
                     st.session_state.stop = True
+                    stop_event = st.session_state.get('stop_event')
+                    if stop_event is not None:
+                        stop_event.set()
                     st.session_state.processing = False
                     try:
                         st.rerun()
@@ -87,26 +94,33 @@ def main():
         if start_clicked and not st.session_state.get('processing', False):
             st.session_state.stop = False
             st.session_state.processing = True
+            st.session_state.stop_event = threading.Event()
             try:
                 st.rerun()
             except Exception:
                 st.experimental_rerun()
 
+        progress_area = st.container()
+
         # When processing is active, run the long task and show progress + Stop button
         if st.session_state.get('processing', False):
-            try:
-                xml_progress_bar = st.progress(0.0, text="XML • Starting…")
-            except Exception:
-                xml_progress_bar = st.progress(0)
-
-            json_progress_bar = None
-            if fetch_holdings:
+            with progress_area:
                 try:
-                    json_progress_bar = st.progress(0.0, text="JSON • Starting…")
+                    xml_progress_bar = st.progress(0.0, text="XML • Starting…")
                 except Exception:
-                    json_progress_bar = st.progress(0)
+                    xml_progress_bar = st.progress(0)
 
-            remaining_time_placeholder = st.empty()
+                json_progress_bar = None
+                if fetch_holdings:
+                    try:
+                        json_progress_bar = st.progress(0.0, text="JSON • Starting…")
+                    except Exception:
+                        json_progress_bar = st.progress(0)
+
+                remaining_time_placeholder = st.empty()
+                usage_placeholder = st.empty()
+                render_worldcat_usage(usage_placeholder)
+
             start_time = datetime.now()
             # Keep worker count small; API throughput is controlled by the global 2 req/s limiter.
             max_workers = DEFAULT_WORKERS
@@ -121,6 +135,7 @@ def main():
                 remaining_time_placeholder=remaining_time_placeholder,
                 json_progress_bar=json_progress_bar,
                 usage_placeholder=usage_placeholder,
+                stop_event=st.session_state.get('stop_event'),
             )
 
             st.session_state.all_fetched = all_fetched
@@ -128,9 +143,17 @@ def main():
             st.session_state.error_list = error_list
             # Mark processing ended
             st.session_state.processing = False
+            st.session_state.stop_event = None
 
             render_worldcat_usage(usage_placeholder)
             update_session_state(all_fetched, all_saved, error_list)
+        else:
+            with progress_area:
+                try:
+                    usage_placeholder = st.empty()
+                    render_worldcat_usage(usage_placeholder)
+                except Exception:
+                    pass
 
     # Show export buttons only if all required files are present for all OCNs
     if st.session_state.all_fetched and st.session_state.all_saved and csv_uploaded:

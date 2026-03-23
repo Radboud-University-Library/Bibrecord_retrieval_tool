@@ -99,28 +99,43 @@ def process_data(
 
     Returns: (all_fetched, all_saved, error_list)
     """
-    # Pre-filter: normalize, drop duplicates, and optionally skip already-downloaded OCNs
+    # Pre-filter: normalize, drop duplicates, and detect what is already cached on disk.
     original_df = data_frame
+    existing_xml = set()
+    existing_json = set()
     try:
         df = data_frame.copy()
         df['OCLC Number'] = df['OCLC Number'].astype(str).str.strip()
         df = df[df['OCLC Number'] != ""]
         df = df.drop_duplicates(subset=['OCLC Number'])
+        requested_dir = os.path.join('OCNrecords', 'requested')
+        try:
+            existing_xml = set(os.path.splitext(f)[0] for f in os.listdir(requested_dir) if f.endswith('.xml'))
+        except FileNotFoundError:
+            existing_xml = set()
+
         if fetch_holdings:
-            # When fetching holdings, process all OCNs (even those with existing XML) so holdings can be fetched-only
-            data_frame = df
-        else:
-            requested_dir = os.path.join('OCNrecords', 'requested')
+            holdings_dir = os.path.join('OCNrecords', 'requested_holdings')
             try:
-                existing = set(os.path.splitext(f)[0] for f in os.listdir(requested_dir))
+                existing_json = {
+                    os.path.splitext(f)[0][:-9]
+                    for f in os.listdir(holdings_dir)
+                    if f.endswith('_holdings.json')
+                }
             except FileNotFoundError:
-                existing = set()
-            data_frame = df[~df['OCLC Number'].isin(existing)]
+                existing_json = set()
+
+            needs_work = ~(
+                df['OCLC Number'].isin(existing_xml) & df['OCLC Number'].isin(existing_json)
+            )
+            data_frame = df[needs_work]
+        else:
+            data_frame = df[~df['OCLC Number'].isin(existing_xml)]
     except Exception:
         df = original_df
 
     # Totals
-    xml_total = int(len(data_frame))
+    xml_total = int(len(df))
     if fetch_holdings:
         try:
             json_total = int(len(df))
@@ -156,25 +171,29 @@ def process_data(
     last_usage_update = 0.0
     usage_update_interval = 0.25
 
-    # Sub-step counters
-    xml_completed = 0
-    json_completed = 0
+    ocn_values = df['OCLC Number'].astype(str).tolist()
+
+    # Sub-step counters start from what is already cached locally.
+    xml_completed = sum(1 for ocn in ocn_values if ocn in existing_xml)
+    json_completed = sum(1 for ocn in ocn_values if ocn in existing_json) if fetch_holdings else 0
+    runtime_xml_completed = 0
 
     reporter = ProgressReporter()
 
     def apply_reporter_events(max_items: int = 100):
-        nonlocal xml_completed, json_completed, ema_sec_per_item
+        nonlocal xml_completed, json_completed, runtime_xml_completed, ema_sec_per_item
         changed = False
         for (kind, _ocn_evt) in reporter.drain(max_items):
             if kind == "xml":
                 xml_completed += 1
+                runtime_xml_completed += 1
                 changed = True
             elif kind == "json":
                 json_completed += 1
                 changed = True
 
-        if changed and xml_completed > 0:
-            curr_sec_per_item = (datetime.now() - start_time).total_seconds() / max(1, xml_completed)
+        if changed and runtime_xml_completed > 0:
+            curr_sec_per_item = (datetime.now() - start_time).total_seconds() / max(1, runtime_xml_completed)
             if ema_sec_per_item is None:
                 ema_sec_per_item = curr_sec_per_item
             else:
@@ -200,26 +219,32 @@ def process_data(
         last_ui_update = now
 
         frac = xml_completed / max(1, xml_total)
-        if xml_completed == 0 and not final:
-            text = f"XML • Starting… 0/{xml_total}"
-        else:
-            elapsed = (datetime.now() - start_time).total_seconds()
-            if ema_sec_per_item is None or xml_completed == 0:
-                sec_per_item = elapsed / max(1, xml_completed)
-            else:
-                sec_per_item = ema_sec_per_item
-            remaining = sec_per_item * max(0, xml_total - xml_completed)
-            text = f"XML • {int(frac*100)}% • {xml_completed}/{xml_total} • ETA {_format_eta(remaining)}"
-
+        remaining_work = max(0, xml_total - xml_completed)
         if final:
             try:
                 if stopped_by_user:
                     xml_progress_bar.progress(frac, text=f"XML • {int(frac*100)}% • {xml_completed}/{xml_total} • Stopped")
-                else:
+                elif xml_completed >= xml_total:
                     xml_progress_bar.progress(1.0, text=f"XML • 100% • {xml_total}/{xml_total} • Done")
+                else:
+                    xml_progress_bar.progress(frac, text=f"XML • {int(frac*100)}% • {xml_completed}/{xml_total} • Finished with errors")
             except Exception:
-                xml_progress_bar.progress(frac if stopped_by_user else 1.0)
+                xml_progress_bar.progress(frac if xml_completed < xml_total or stopped_by_user else 1.0)
         else:
+            if xml_completed == 0:
+                text = f"XML • Starting… 0/{xml_total}"
+            elif remaining_work == 0:
+                text = f"XML • 100% • {xml_completed}/{xml_total} • Done"
+            elif runtime_xml_completed == 0:
+                text = f"XML • {int(frac*100)}% • {xml_completed}/{xml_total} • ETA estimating…"
+            else:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                if ema_sec_per_item is None:
+                    sec_per_item = elapsed / max(1, runtime_xml_completed)
+                else:
+                    sec_per_item = ema_sec_per_item
+                remaining = sec_per_item * remaining_work
+                text = f"XML • {int(frac*100)}% • {xml_completed}/{xml_total} • ETA {_format_eta(remaining)}"
             try:
                 xml_progress_bar.progress(frac, text=text)
             except Exception:
@@ -230,17 +255,26 @@ def process_data(
         if not fetch_holdings or json_progress_bar is None:
             return
         frac = json_completed / max(1, json_total)
+        remaining_work = max(0, json_total - json_completed)
         if final:
             try:
                 if stopped_by_user:
                     json_progress_bar.progress(frac, text=f"JSON • {int(frac*100)}% • {json_completed}/{json_total} • Stopped")
-                else:
+                elif json_completed >= json_total:
                     json_progress_bar.progress(1.0, text=f"JSON • 100% • {json_total}/{json_total} • Done")
+                else:
+                    json_progress_bar.progress(frac, text=f"JSON • {int(frac*100)}% • {json_completed}/{json_total} • Finished with errors")
             except Exception:
-                json_progress_bar.progress(frac if stopped_by_user else 1.0)
+                json_progress_bar.progress(frac if json_completed < json_total or stopped_by_user else 1.0)
             return
+        if json_completed == 0:
+            text = f"JSON • Starting… 0/{json_total}"
+        elif remaining_work == 0:
+            text = f"JSON • 100% • {json_completed}/{json_total} • Done"
+        else:
+            text = f"JSON • {int(frac*100)}% • {json_completed}/{json_total}"
         try:
-            json_progress_bar.progress(frac, text=f"JSON • {int(frac*100)}% • {json_completed}/{json_total}")
+            json_progress_bar.progress(frac, text=text)
         except Exception:
             json_progress_bar.progress(frac)
 
@@ -248,10 +282,7 @@ def process_data(
     push_xml_progress(force=True)
     push_usage(force=True)
     if fetch_holdings and json_progress_bar is not None:
-        try:
-            json_progress_bar.progress(0.0, text=f"JSON • Starting… 0/{json_total}")
-        except Exception:
-            json_progress_bar.progress(0.0)
+        push_json_progress(force=True)
 
     # Submit tasks
     ocns = data_frame['OCLC Number'].astype(str).tolist()
@@ -270,7 +301,15 @@ def process_data(
                 next_ocn = next(ocn_iter)
             except StopIteration:
                 return False
-            future = executor.submit(fetch_and_save_data, next_ocn, fetch_holdings, reporter, stop_event)
+            future = executor.submit(
+                fetch_and_save_data,
+                next_ocn,
+                fetch_holdings,
+                reporter,
+                stop_event,
+                False,
+                False,
+            )
             futures[future] = next_ocn
             return True
 

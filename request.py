@@ -251,10 +251,19 @@ def save_holdingsdata(ocn, holdings_data):
         json.dump(holdings_data, file, ensure_ascii=False)
 
 
-def fetch_and_save_data(ocn, fetch_holdings, reporter=None, stop_event=None):
+def fetch_and_save_data(
+    ocn,
+    fetch_holdings,
+    reporter=None,
+    stop_event=None,
+    report_existing_xml=True,
+    report_existing_json=True,
+):
     """
     Fetch and save the record with the given OCN and optionally fetch holdings.
     Uses the functions above. Reports sub-step completion via `reporter` if provided.
+    Existing local files can be excluded from reporter events so the caller can
+    pre-seed progress from disk without double counting cached records.
     Returns (ocn, error or None).
     """
     # Precompute target filepaths using constants
@@ -266,7 +275,7 @@ def fetch_and_save_data(ocn, fetch_holdings, reporter=None, stop_event=None):
     if os.path.exists(xml_filepath):
         try:
             # Report XML already done
-            if reporter is not None:
+            if reporter is not None and report_existing_xml:
                 try:
                     reporter.xml_done(ocn)
                 except Exception:
@@ -274,7 +283,7 @@ def fetch_and_save_data(ocn, fetch_holdings, reporter=None, stop_event=None):
             # Handle holdings
             if fetch_holdings:
                 if os.path.exists(holdings_filepath):
-                    if reporter is not None:
+                    if reporter is not None and report_existing_json:
                         try:
                             reporter.json_done(ocn)
                         except Exception:
@@ -307,7 +316,7 @@ def fetch_and_save_data(ocn, fetch_holdings, reporter=None, stop_event=None):
         # Fetch holdings if the checkbox was selected and holdings not already fetched
         if fetch_holdings:
             if os.path.exists(holdings_filepath):
-                if reporter is not None:
+                if reporter is not None and report_existing_json:
                     try:
                         reporter.json_done(ocn)
                     except Exception:

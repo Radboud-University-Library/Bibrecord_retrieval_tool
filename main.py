@@ -26,6 +26,7 @@ DEFAULT_WORKERS = 5
 
 def main():
     """Main function to set up the Streamlit interface and handle user interactions."""
+    st.set_page_config(page_title="Bibrecord Retrieval Tool")
     st.title("Bibrecord Retrieval Tool")
 
     # Upload CSV file

@@ -277,6 +277,10 @@ def _merge_excel_files_streaming(xml_filename, json_filename, merged_filename):
         if row is None:
             continue
         xml_values = list(row)
+        if len(xml_values) < len(xml_header):
+            # Streaming reads can omit trailing empty XML cells; pad them so the
+            # appended holdings columns always land under the fixed merge header.
+            xml_values.extend([None] * (len(xml_header) - len(xml_values)))
         ocn = _normalize_ocn(xml_values[xml_ocn_idx] if xml_ocn_idx < len(xml_values) else None)
         has_match = ocn in holdings_map
         json_values = holdings_map.get(ocn, [None] * len(json_cols)) if include_sum else []

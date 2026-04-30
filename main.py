@@ -123,7 +123,7 @@ def main():
                 render_worldcat_usage(usage_placeholder)
 
             start_time = datetime.now()
-            # Keep worker count small; API throughput is controlled by the global 2 req/s limiter.
+            # Keep worker count small; API throughput is controlled by the global request limiter.
             max_workers = DEFAULT_WORKERS
             st.caption(f"Using {max_workers} worker threads with global API pacing at 2 requests/second.")
 

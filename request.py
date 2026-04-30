@@ -12,6 +12,7 @@ import json
 import configparser
 import threading
 import time
+import re
 from worldcat_quota import WorldCatDailyQuotaError, reserve_requests
 
 
@@ -88,15 +89,12 @@ token = WorldcatAccessToken(
     agent=agent,
 )
 
-# Configure the MetadataSession with automatic retry functionality
-# Include 429 for rate limiting and a slightly higher backoff for stability
+# Configure the MetadataSession without transport-level retries.
+# Retries are handled explicitly below so every retry attempt still passes
+# through the global rate limiter and daily quota tracker.
 SESSION_CONFIG = {
     "authorization": token,
     "timeout": 30,
-    "totalRetries": 5,
-    "backoffFactor": 0.5,
-    "statusForcelist": [429, 500, 502, 503, 504],
-    "allowedMethods": ["GET"],
     "agent": agent,  # identify the app on all Metadata API calls
 }
 
@@ -131,9 +129,63 @@ class SimpleRateLimiter:
                 wait_time = self.next_allowed_time - now
             self.next_allowed_time = now + self.interval
 
-# API RATE LIMITER: Enforces a strict requests-per-second limit.
-# WorldCat API keys are limited to 2 requests per second.
+# API RATE LIMITER: match the published per-key limit.
 API_RATE_LIMITER = SimpleRateLimiter(2.0)
+MAX_REQUEST_ATTEMPTS = 4
+
+
+def _extract_status_code(exc) -> int | None:
+    """Best-effort extraction of an HTTP status code from wrapped request errors."""
+    try:
+        status = getattr(exc, 'status_code', None) or getattr(getattr(exc, 'response', None), 'status_code', None)
+        if status is not None:
+            return int(status)
+    except Exception:
+        pass
+
+    match = re.search(r"\b([1-5]\d{2})\b", str(exc))
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _sleep_with_stop(delay_seconds: float, stop_event=None):
+    remaining = max(0.0, float(delay_seconds))
+    while remaining > 0:
+        _check_stop_requested(stop_event)
+        sleep_chunk = min(remaining, 0.1)
+        time.sleep(sleep_chunk)
+        remaining -= sleep_chunk
+
+
+def _is_retryable_request_error(exc) -> bool:
+    """Return True for transient failures worth retrying under our own limiter."""
+    status = _extract_status_code(exc)
+    if status in {429, 500, 502, 503, 504}:
+        return True
+
+    message = str(exc).lower()
+    return any(fragment in message for fragment in (
+        "rate limit",
+        "timed out",
+        "timeout",
+        "connection error",
+        "connection aborted",
+        "connection reset",
+        "connection refused",
+        "temporarily unavailable",
+    ))
+
+
+def _retry_delay_seconds(exc, attempt_number: int) -> float:
+    """Back off more aggressively after rate limits than after generic transient errors."""
+    status = _extract_status_code(exc)
+    if status == 429 or "rate limit" in str(exc).lower():
+        return min(30.0, 2.0 * (2 ** (attempt_number - 1)))
+    return min(10.0, 0.75 * (2 ** (attempt_number - 1)))
 
 
 def _check_stop_requested(stop_event=None):
@@ -147,6 +199,26 @@ def _prepare_api_call(stop_event=None):
     API_RATE_LIMITER.wait(stop_event=stop_event)
     _check_stop_requested(stop_event)
     reserve_requests(1)
+
+
+def _perform_api_call(api_call, stop_event=None):
+    """Run an API call with quota-aware retries under the global rate limiter."""
+    last_error = None
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        _check_stop_requested(stop_event)
+        _prepare_api_call(stop_event=stop_event)
+        try:
+            return api_call()
+        except Exception as exc:
+            if isinstance(exc, (WorldCatDailyQuotaError, UserStopRequestedError)):
+                raise
+            last_error = exc
+            if attempt >= MAX_REQUEST_ATTEMPTS or not _is_retryable_request_error(exc):
+                raise
+            _sleep_with_stop(_retry_delay_seconds(exc, attempt), stop_event=stop_event)
+
+    if last_error is not None:
+        raise last_error
 
 
 def _get_session():
@@ -170,9 +242,10 @@ def _get_session():
 def fetch_marcxmldata(ocn, stop_event=None):
     """Fetch XML data for an OCN using the WorldCat Metadata API. Returns bytes."""
     session = _get_session()
-    # Global per-key pacing gate (2 requests/second).
-    _prepare_api_call(stop_event=stop_event)
-    response = session.bib_get(ocn)
+    response = _perform_api_call(
+        lambda: session.bib_get(ocn),
+        stop_event=stop_event,
+    )
     return response.content  # bytes
 
 
@@ -205,11 +278,12 @@ def fetch_holdingsdata(ocn, held_by_symbols=None, stop_event=None):
     for symbol in held_by_symbols:
         try:
             _check_stop_requested(stop_event)
-            # Global per-key pacing gate (2 requests/second).
-            _prepare_api_call(stop_event=stop_event)
-            response = session.summary_holdings_get(
-                oclcNumber=ocn,
-                heldBySymbol=symbol,
+            response = _perform_api_call(
+                lambda current_symbol=symbol: session.summary_holdings_get(
+                    oclcNumber=ocn,
+                    heldBySymbol=current_symbol,
+                ),
+                stop_event=stop_event,
             )
             holdings = response.json()
             holdings_data = {
@@ -225,7 +299,7 @@ def fetch_holdingsdata(ocn, held_by_symbols=None, stop_event=None):
                 raise e
             if isinstance(e, UserStopRequestedError):
                 raise e
-            status = getattr(e, 'status_code', None) or getattr(getattr(e, 'response', None), 'status_code', None)
+            status = _extract_status_code(e)
             if status == 429:
                 # If we're hitting 429 even with retries, we might want to re-raise
                 # so the caller can decide whether to abort.

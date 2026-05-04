@@ -26,12 +26,7 @@ def _friendly_error_message(exc) -> str:
     Attempts to surface HTTP status codes, authentication/rate-limit issues,
     timeouts, and common network failures in plain language.
     """
-    # Try to extract HTTP status code if available
-    status = None
-    try:
-        status = getattr(exc, 'status_code', None) or getattr(getattr(exc, 'response', None), 'status_code', None)
-    except Exception:
-        status = None
+    status = _extract_status_code(exc)
 
     msg = str(exc) if exc else ""
     low = msg.lower()
@@ -106,6 +101,7 @@ os.makedirs(HOLDINGS_DIR, exist_ok=True)
 
 # Thread-local storage for reusing a MetadataSession per worker thread
 _thread_local = threading.local()
+_token_refresh_lock = threading.Lock()
 
 class SimpleRateLimiter:
     """A simple thread-safe rate limiter that ensures a minimum interval between calls."""
@@ -150,6 +146,38 @@ def _extract_status_code(exc) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def _is_auth_error(exc) -> bool:
+    status = _extract_status_code(exc)
+    if status == 401:
+        return True
+
+    message = str(exc).lower()
+    return "401" in message or "unauthorized" in message
+
+
+def _sync_session_authorization(session):
+    """Keep a worker session's Authorization header aligned with the shared token."""
+    try:
+        session.headers.update({"Authorization": f"Bearer {session.authorization.token_str}"})
+    except Exception:
+        pass
+
+
+def _refresh_session_authorization(session, force: bool = False):
+    """Refresh the shared token once and update the current session header."""
+    with _token_refresh_lock:
+        expected_header = f"Bearer {session.authorization.token_str}"
+        current_header = session.headers.get("Authorization")
+        should_request_new_token = session.authorization.is_expired()
+
+        if force and current_header == expected_header:
+            should_request_new_token = True
+
+        if should_request_new_token:
+            session._get_new_access_token()
+        _sync_session_authorization(session)
 
 
 def _sleep_with_stop(delay_seconds: float, stop_event=None):
@@ -201,18 +229,25 @@ def _prepare_api_call(stop_event=None):
     reserve_requests(1)
 
 
-def _perform_api_call(api_call, stop_event=None):
+def _perform_api_call(api_call, session=None, stop_event=None):
     """Run an API call with quota-aware retries under the global rate limiter."""
     last_error = None
+    auth_retry_used = False
     for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
         _check_stop_requested(stop_event)
         _prepare_api_call(stop_event=stop_event)
+        if session is not None:
+            _sync_session_authorization(session)
         try:
             return api_call()
         except Exception as exc:
             if isinstance(exc, (WorldCatDailyQuotaError, UserStopRequestedError)):
                 raise
             last_error = exc
+            if session is not None and _is_auth_error(exc) and not auth_retry_used:
+                auth_retry_used = True
+                _refresh_session_authorization(session, force=True)
+                continue
             if attempt >= MAX_REQUEST_ATTEMPTS or not _is_retryable_request_error(exc):
                 raise
             _sleep_with_stop(_retry_delay_seconds(exc, attempt), stop_event=stop_event)
@@ -236,6 +271,7 @@ def _get_session():
             except Exception:
                 pass
         _thread_local.session = session
+    _sync_session_authorization(session)
     return session
 
 
@@ -244,6 +280,7 @@ def fetch_marcxmldata(ocn, stop_event=None):
     session = _get_session()
     response = _perform_api_call(
         lambda: session.bib_get(ocn),
+        session=session,
         stop_event=stop_event,
     )
     return response.content  # bytes
@@ -283,6 +320,7 @@ def fetch_holdingsdata(ocn, held_by_symbols=None, stop_event=None):
                     oclcNumber=ocn,
                     heldBySymbol=current_symbol,
                 ),
+                session=session,
                 stop_event=stop_event,
             )
             holdings = response.json()
